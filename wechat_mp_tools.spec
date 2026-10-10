@@ -78,6 +78,7 @@ hiddenimports = [
     'backend.account_pool',
     'backend.account_pool_api',
     'backend.weread_browser',
+    'backend.weread_signer',
     'backend.articles',
     'backend.proxy',
     'backend.douyin',

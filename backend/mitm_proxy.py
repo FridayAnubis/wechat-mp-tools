@@ -1199,20 +1199,25 @@ class ChannelsAddon:
                     m_biz = re.search(r'(?:var\s+biz\s*=\s*|window\.biz\s*=\s*|__biz=)"?([^"&\'\s]+)"?', html)
                     m_token = re.search(r'(?:var\s+appmsg_token\s*=\s*|window\.appmsg_token\s*=\s*|appmsg_token=)"?([^"&\'\s]+)"?', html)
                     m_nick = re.search(r'(?:var\s+nickname\s*=\s*|window\.nickname\s*=\s*)"([^"\r\n]+)"', html)
+                    m_author_id = re.search(r'(?:["\']?author_id["\']?\s*[:=]\s*["\']|getXmlValue\([\'"]author_id\.DATA[\'"]\)\s*:\s*[\'"]|authorId\s*[:=]\s*["\'])([^"\'<>\s]+)', html)
                     sniffed_biz = m_biz.group(1) if m_biz else ""
                     sniffed_token = m_token.group(1) if m_token else ""
                     sniffed_nick = m_nick.group(1) if m_nick else ""
+                    sniffed_author_id = m_author_id.group(1) if m_author_id else ""
                     if sniffed_biz:
                         from backend.account_pool import account_pool, AccountPool
                         if AccountPool._is_favorite_biz(sniffed_biz):
                             account_pool.add_or_update({
                                 "biz": sniffed_biz,
                                 "appmsg_token": sniffed_token,
+                                "author_id": sniffed_author_id,
                                 "nickname": sniffed_nick or "动态微信凭证",
                                 "biz_name": sniffed_nick,
                                 "biz_source": "article",
                                 "save_time": time.time(),
                             })
+                            if sniffed_author_id:
+                                print(f"[Proxy HTML Sniff] 捕获到原创文章 author_id={sniffed_author_id} for biz={sniffed_biz}", flush=True)
             except Exception as ex_sniff:
                 print(f"[Proxy HTML Sniff Error] {ex_sniff}", flush=True)
         else:
