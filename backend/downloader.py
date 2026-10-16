@@ -11,6 +11,7 @@ import json
 import shutil
 import subprocess
 import requests
+import logging
 from pathlib import Path
 from datetime import datetime, timezone
 from urllib.parse import urlparse, parse_qs, quote, unquote
@@ -20,6 +21,8 @@ from html.parser import HTMLParser
 from backend.config import (
     DEFAULT_HEADERS, get_proxies_dict, get_settings, report_proxy_status
 )
+
+logger = logging.getLogger(__name__)
 
 
 MPVIDEO_RE = re.compile(r'(?:https?:)?//mpvideo\.qpic\.cn/[^"\'\s<>]+?\.mp4(?:\?[^"\'\s<>]+)?', re.I)
@@ -724,15 +727,297 @@ def replace_video_iframe(html: str, video: dict, local: str) -> str:
     return pattern.sub(local, html)
 
 
-def download_single_article(url: str, out_dir: Path, title_hint: str = "", _redirect_depth: int = 0) -> dict:
+_canonical_url_cache = {}
+
+
+def clean_wechat_article_url(url: str) -> str:
+    """清理公众号推文链接，去除引起风控识别的跟踪与环境参数 (参考 we-mp-rss 规范化清洗)"""
+    if not url:
+        return ""
+    try:
+        from urllib.parse import urlparse, parse_qs, urlencode, urlunparse
+        parsed = urlparse(url)
+        if "mp.weixin.qq.com" not in parsed.netloc:
+            return url
+        query = parse_qs(parsed.query)
+        # 移除容易触发风控检查或重定向验证码的冗余参数
+        drop_keys = {
+            "scene", "subscene", "sessionid", "chksm", "sharer_shareid",
+            "sharer_sharetime", "key", "pass_ticket", "uin", "devicetype",
+            "version", "x5", "src", "asc", "clicktime", "enterid", "rd2exitd",
+            "item_show_type", "exportkey"
+        }
+        clean_q = {k: v for k, v in query.items() if k not in drop_keys}
+        fragment = "" if parsed.fragment == "wechat_redirect" else parsed.fragment
+        return urlunparse((
+            parsed.scheme or "https",
+            parsed.netloc,
+            parsed.path,
+            "",
+            urlencode(clean_q, doseq=True, safe="=:/%"),
+            fragment
+        ))
+    except Exception:
+        return url
+
+
+def resolve_canonical_short_url(url: str, review_id: str = "") -> str:
+    """将微信长链接或 review_id 解析为免验证码风控的标准短链 (https://mp.weixin.qq.com/s/{short_id})"""
+    if not url:
+        return ""
+    if "/s/" in url and "__biz=" not in url:
+        return url
+
+    cache_key = f"{url}::{review_id}"
+    if cache_key in _canonical_url_cache:
+        return _canonical_url_cache[cache_key]
+
+    # 1. 若 review_id 存在且包含下划线，提取其末尾的 short_id
+    if review_id and "_" in review_id:
+        sid = review_id.split("_")[-1]
+        if len(sid) >= 15:
+            res = f"https://mp.weixin.qq.com/s/{sid}"
+            _canonical_url_cache[cache_key] = res
+            return res
+
+    # 2. 调用微信读书接口通过 URL 查询 reviewId
+    try:
+        from backend.account_pool import borrow_weread_session, get_weread_session
+        acc_id, vid, tok, h = borrow_weread_session()
+        s = get_weread_session()
+        res = s.post("https://i.weread.qq.com/mp/getreviewid", json={"urls": [url]}, headers=h, timeout=6).json()
+        for item in res.get("reviewIds", []):
+            rid = item.get("reviewId", "")
+            if rid and "_" in rid:
+                sid = rid.split("_")[-1]
+                if len(sid) >= 15:
+                    resolved = f"https://mp.weixin.qq.com/s/{sid}"
+                    _canonical_url_cache[cache_key] = resolved
+                    return resolved
+    except Exception as e:
+        logger.debug(f"[ShortURL] 解析推文短链异常: {e}")
+
+    _canonical_url_cache[cache_key] = url
+    return url
+
+
+def get_wechat_mobile_headers() -> dict:
+    """生成真实的移动端微信客户端 (XWEB / MMWEBSDK) 请求头，避免触发桌面端反爬策略 (参考 we-mp-rss)"""
+    import random
+    versions = [
+        ("8.0.48.2580", "122.0.6261.119", "XWEB/1220133 MMWEBSDK/20240404"),
+        ("8.0.49.2600", "126.0.6478.122", "XWEB/1260079 MMWEBSDK/20240501"),
+        ("8.0.50.2620", "126.0.6478.182", "XWEB/1260121 MMWEBSDK/20240601"),
+    ]
+    ver, chrome_ver, mmweb = random.choice(versions)
+    ua = (
+        f"Mozilla/5.0 (Linux; Android 14; Mobile; SM-S9280 Build/UP1A.231005.007; wv) "
+        f"AppleWebKit/537.36 (KHTML, like Gecko) Version/4.0 Chrome/{chrome_ver} Mobile Safari/537.36 "
+        f"{mmweb} MMWEBID/1000 MicroMessenger/{ver} NetType/WIFI Language/zh_CN ABI/arm64"
+    )
+    return {
+        "User-Agent": ua,
+        "X-Requested-With": "com.tencent.mm",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
+        "Accept-Language": "zh-CN,zh;q=0.9,en-US;q=0.8,en;q=0.7",
+        "Accept-Encoding": "gzip, deflate, br",
+        "Referer": "https://mp.weixin.qq.com/",
+        "Sec-Fetch-Dest": "document",
+        "Sec-Fetch-Mode": "navigate",
+        "Sec-Fetch-Site": "same-origin",
+        "Upgrade-Insecure-Requests": "1",
+    }
+
+
+def check_wechat_risk_control(html: str, final_url: str = "") -> tuple[bool, str]:
+    """检测页面是否为微信风控页、验证码或异常拦截页 (参考 we-mp-rss 异常特征)"""
+    if not html:
+        return True, "页面内容为空"
+    if 'wappoc_appmsgcaptcha' in (final_url or "") or 'wappoc_appmsgcaptcha' in html:
+        return True, "微信验证码拦截 (wappoc_appmsgcaptcha)"
+    if "当前环境异常，完成验证后即可继续访问" in html:
+        return True, "当前环境异常，需完成安全验证"
+    if "未知错误，请稍后再试" in html:
+        return True, "未知错误，请稍后再试"
+    if "你暂无权限查看此页面内容" in html:
+        return True, "你暂无权限查看此页面内容"
+    if "操作频繁，请稍后再试" in html:
+        return True, "操作频繁，请稍后再试"
+    return False, ""
+
+
+def fetch_via_weread_content(review_id: str) -> tuple[str, bool]:
+    """【优先通道】通过微信读书官方接口获取文章全文 HTML (腾讯内网，完全规避公众号风控网关)"""
+    if not review_id:
+        return "", False
+    try:
+        from backend.account_pool import borrow_weread_session, get_weread_session
+        acc_id, vid, tok, h = borrow_weread_session()
+        s = get_weread_session()
+        web_h = {
+            "Cookie": h.get("Cookie", ""),
+            "User-Agent": h.get("User-Agent", ""),
+            "Referer": "https://weread.qq.com/",
+            "Origin": "https://weread.qq.com",
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+        }
+        resp = s.get(
+            "https://weread.qq.com/web/mp/content",
+            params={"reviewId": review_id},
+            headers=web_h,
+            timeout=15,
+        )
+        if resp.status_code == 200:
+            html = resp.text
+            if 'id="js_content"' in html or 'class="rich_media_content"' in html:
+                return html, True
+    except Exception as e:
+        logger.debug(f"[WeRead Content] 通过 review_id={review_id} 拉取全文失败: {e}")
+    return "", False
+
+
+def fetch_via_headless_browser(url: str, proxy_url: str = None) -> tuple[str, str]:
+    """【兜底通道】当直接 HTTP 请求遭遇风控时，启动无头 Chromium 模拟微信环境加载完整渲染页面 (参考 we-mp-rss Playwright 驱动)"""
+    try:
+        from playwright.sync_api import sync_playwright
+        from backend.runtime import launch_chromium
+        headers = get_wechat_mobile_headers()
+        ua = headers["User-Agent"]
+
+        launch_args = [
+            "--disable-blink-features=AutomationControlled",
+            "--no-sandbox",
+            "--disable-setuid-sandbox",
+        ]
+        proxy_config = None
+        if proxy_url:
+            proxy_config = {"server": proxy_url}
+
+        with sync_playwright() as p:
+            browser = launch_chromium(
+                p.chromium,
+                headless=True,
+                args=launch_args,
+                proxy=proxy_config,
+            )
+            try:
+                context = browser.new_context(
+                    user_agent=ua,
+                    viewport={"width": 414, "height": 896},
+                    extra_http_headers={"X-Requested-With": "com.tencent.mm"},
+                )
+                context.add_init_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined});")
+                page = context.new_page()
+                page.goto(url, wait_until="domcontentloaded", timeout=25000)
+
+                # 等待正文元素渲染
+                try:
+                    page.wait_for_selector("#js_content, #js_article, .rich_media_content", timeout=8000)
+                except Exception:
+                    pass
+
+                # 模拟轻度滚动以触发图片懒加载
+                try:
+                    page.evaluate("() => window.scrollTo(0, document.body.scrollHeight / 3)")
+                    page.wait_for_timeout(600)
+                except Exception:
+                    pass
+
+                html = page.content()
+                is_risk, reason = check_wechat_risk_control(html, page.url)
+                if is_risk:
+                    return "", f"浏览器渲染仍被风控拦截: {reason}"
+                return html, ""
+            finally:
+                browser.close()
+    except Exception as exc:
+        return "", f"浏览器兜底抓取异常: {str(exc)}"
+
+
+def fetch_wechat_article_html(url: str, review_id: str = "") -> tuple[str, str, str]:
+    """多级抗风控综合抓取策略 (参考 rachelos/we-mp-rss 规范化与短链映射机制)：
+    1. 短链规范化转换 (通过 reviewId 或 WeRead 接口将长 __biz 链接映射为免验证码风控的标准短链)
+    2. 高仿真移动端微信 HTTP 请求 (携带 X-Requested-With、现代移动端 UA、清洗追踪参数)
+    3. WeRead Web 官方接口 (若有 reviewId，尝试拉取全文)
+    4. 无头 Chromium 渲染兜底 (当且仅当命中验证码或环境异常时自动接管)
+
+    返回: (raw_html, final_url, error_message)
     """
-    下载单篇文章
+    clean_orig_url = clean_wechat_article_url(url)
+    canonical_short_url = resolve_canonical_short_url(url, review_id=review_id)
+    clean_short_url = clean_wechat_article_url(canonical_short_url)
+
+    urls_to_try = []
+    if clean_short_url:
+        urls_to_try.append(clean_short_url)
+    if clean_orig_url and clean_orig_url not in urls_to_try:
+        urls_to_try.append(clean_orig_url)
+
+    proxies = get_proxies_dict()
+    proxy_url = proxies.get("http") if proxies else None
+    http_error = ""
+    headers = get_wechat_mobile_headers()
+
+    for target_url in urls_to_try:
+        try:
+            resp = requests.get(
+                target_url,
+                headers=headers,
+                proxies=proxies,
+                timeout=25,
+                allow_redirects=True,
+            )
+            if resp.status_code == 200:
+                try:
+                    raw_html = resp.content.decode("utf-8")
+                except UnicodeDecodeError:
+                    try:
+                        raw_html = resp.content.decode("gb18030", errors="replace")
+                    except Exception:
+                        raw_html = resp.content.decode("utf-8", errors="replace")
+
+                final_url = resp.url if hasattr(resp, "url") else target_url
+                is_risk, reason = check_wechat_risk_control(raw_html, final_url)
+                if not is_risk:
+                    report_proxy_status(proxy_url, success=True)
+                    return raw_html, final_url, ""
+                else:
+                    http_error = reason
+                    report_proxy_status(proxy_url, success=False)
+            else:
+                http_error = f"HTTP {resp.status_code}"
+                report_proxy_status(proxy_url, success=False)
+        except Exception as e:
+            http_error = str(e)
+            report_proxy_status(proxy_url, success=False)
+
+    # 微信读书官方正文通道
+    if review_id:
+        html, ok = fetch_via_weread_content(review_id)
+        if ok:
+            return html, clean_orig_url, ""
+
+    # 无头浏览器渲染兜底
+    chosen_url = clean_short_url or clean_orig_url
+    logger.info(f"[Fetcher] HTTP 请求受限 ({http_error})，启用无头浏览器仿真兜底: {chosen_url}")
+    browser_html, browser_error = fetch_via_headless_browser(chosen_url, proxy_url=proxy_url)
+    if browser_html:
+        return browser_html, chosen_url, ""
+
+    return "", clean_orig_url, http_error or browser_error or "抓取文章失败"
+
+
+def download_single_article(url: str, out_dir: Path, title_hint: str = "", _redirect_depth: int = 0, review_id: str = "") -> dict:
+    """
+    下载单篇文章 (具备三级抗风控抓取能力)
 
     Args:
         url: 文章 URL
         out_dir: 输出目录
         title_hint: 标题提示（可选）
         _redirect_depth: 内部参数，用于防止"阅读全文"跳转无限递归
+        review_id: 微信读书文章 reviewId（可选，优先走免风控接口）
 
     Returns:
         dict: {"success": bool, "title": str, "path": str, "error": str}
@@ -747,113 +1032,77 @@ def download_single_article(url: str, out_dir: Path, title_hint: str = "", _redi
     media_dir = art_dir / "media"
     media_dir.mkdir(parents=True, exist_ok=True)
 
-    proxy_url = None
-    try:
-        # 使用 requests 直接获取 HTML（不使用 Scrapling 避免依赖问题）
-        proxies = get_proxies_dict()
-        if proxies:
-            proxy_url = proxies.get("http")
-        resp = requests.get(
-            url,
-            headers={
-                "User-Agent": DEFAULT_HEADERS["User-Agent"],
-                "Referer": "https://mp.weixin.qq.com/",
-            },
-            proxies=proxies,
-            timeout=60,
-        )
-        resp.raise_for_status()
-        report_proxy_status(proxy_url, success=True)
-        try:
-            raw_html = resp.content.decode("utf-8")
-        except UnicodeDecodeError:
-            try:
-                raw_html = resp.content.decode("gb18030", errors="replace")
-            except Exception:
-                raw_html = resp.content.decode("utf-8", errors="replace")
+    clean_url = clean_wechat_article_url(url)
+    proxies = get_proxies_dict()
+    proxy_url = proxies.get("http") if proxies else None
 
-        # 检测 captcha 验证码页面（微信反爬限制，请求被 302 跳转到验证码页）
-        final_url = resp.url if hasattr(resp, 'url') else url
-        if 'wappoc_appmsgcaptcha' in final_url or 'wappoc_appmsgcaptcha' in raw_html:
-            report_proxy_status(proxy_url, success=False)
-            return {"success": False, "title": safe_title, "error": "微信验证码拦截，请稍后重试或更换 IP", "is_permanent": False}
+    raw_html, final_url, fetch_error = fetch_wechat_article_html(clean_url, review_id=review_id)
+    if not raw_html:
+        return {"success": False, "title": safe_title, "error": fetch_error or "获取页面失败", "is_permanent": False}
 
-        # 检测是否为微信屏蔽、删除或出错页面（贴图画廊类型可能不含 js_content/js_article，但含有 picture_page_info_list）
-        has_js_content = 'id="js_content"' in raw_html or 'id="js_article"' in raw_html or 'picture_page_info_list' in raw_html
+    # 检测是否为微信屏蔽、删除或出错页面（贴图画廊类型可能不含 js_content/js_article，但含有 picture_page_info_list）
+    has_js_content = 'id="js_content"' in raw_html or 'id="js_article"' in raw_html or 'picture_page_info_list' in raw_html
 
-        # 提取标题辅助判断
-        title_tag_match = re.search(r'<title>([^<]*)</title>', raw_html, re.I)
-        page_title_tag = title_tag_match.group(1).strip() if title_tag_match else ""
+    # 提取标题辅助判断
+    title_tag_match = re.search(r'<title>([^<]*)</title>', raw_html, re.I)
+    page_title_tag = title_tag_match.group(1).strip() if title_tag_match else ""
 
-        is_error = False
-        error_msg = ""
-        is_permanent = False
+    is_error = False
+    error_msg = ""
+    is_permanent = False
 
-        if not has_js_content:
-            if any(kw in raw_html for kw in ["内容已被作者删除", "已被作者删除"]):
-                is_error = True
-                error_msg = "作者已删除"
-                is_permanent = True
-            elif any(kw in raw_html for kw in ["该内容暂时无法查看", "此内容因违规无法查看", "此内容无法查看"]):
-                is_error = True
-                error_msg = "内容已被微信屏蔽"
-                is_permanent = True
-            elif "链接已过期" in raw_html:
-                is_error = True
-                error_msg = "链接已过期"
-                is_permanent = True
-            elif "系统出错" in raw_html:
-                is_error = True
-                error_msg = "系统出错"
-                is_permanent = False
-            elif 'id="app"' in raw_html:
-                is_error = True
-                error_msg = "隐私保护，仅内部分享可见"
-                is_permanent = True
-            else:
-                is_error = True
-                error_msg = "未知页面"
-                is_permanent = False
-
-        if not is_error and any(kw in page_title_tag for kw in ["该内容暂时无法查看", "系统出错"]):
+    if not has_js_content:
+        if any(kw in raw_html for kw in ["内容已被作者删除", "已被作者删除"]):
             is_error = True
-            if "该内容暂时无法查看" in page_title_tag:
-                error_msg = "内容已被微信屏蔽"
-                is_permanent = True
-            else:
-                error_msg = "系统出错"
-                is_permanent = False
+            error_msg = "作者已删除"
+            is_permanent = True
+        elif any(kw in raw_html for kw in ["该内容暂时无法查看", "此内容因违规无法查看", "此内容无法查看"]):
+            is_error = True
+            error_msg = "内容已被微信屏蔽"
+            is_permanent = True
+        elif "链接已过期" in raw_html:
+            is_error = True
+            error_msg = "链接已过期"
+            is_permanent = True
+        elif "系统出错" in raw_html:
+            is_error = True
+            error_msg = "系统出错"
+            is_permanent = False
+        elif 'id="app"' in raw_html:
+            is_error = True
+            error_msg = "隐私保护，仅内部分享可见"
+            is_permanent = True
+        else:
+            is_error = True
+            error_msg = "页面缺少正文或未能完整解析"
+            is_permanent = False
 
-        if is_error:
-            report_proxy_status(proxy_url, success=False)
-            return {"success": False, "title": safe_title, "error": error_msg, "is_permanent": is_permanent}
+    if not is_error and any(kw in page_title_tag for kw in ["该内容暂时无法查看", "系统出错"]):
+        is_error = True
+        if "该内容暂时无法查看" in page_title_tag:
+            error_msg = "内容已被微信屏蔽"
+            is_permanent = True
+        else:
+            error_msg = "系统出错"
+            is_permanent = False
 
-        # 检测"阅读全文"跳转类型文章（转载/分享文章，js_content 为空，原文 URL 在 js_share_source 的 data-url 中）
-        share_source_match = re.search(r'data-url="([^"]+)"[^>]*id="js_share_source"', raw_html)
-        if not share_source_match:
-            share_source_match = re.search(r'id="js_share_source"[^>]*data-url="([^"]+)"', raw_html)
-        if share_source_match:
-            # 检查 js_content 是否实际为空
-            content_check = re.search(r'id="js_content"[^>]*>([\s\S]*?)</div>', raw_html)
-            content_is_empty = not content_check or not content_check.group(1).strip()
-            if content_is_empty and _redirect_depth < MAX_REDIRECT_DEPTH:
-                original_url = unescape(share_source_match.group(1))
-                # 清理 URL: 去掉 scene=45 和 #wechat_redirect 以避免触发验证码
-                from urllib.parse import urlparse, parse_qs, urlencode, urlunparse
-                parsed = urlparse(original_url)
-                params = parse_qs(parsed.query)
-                params.pop('scene', None)
-                clean_query = urlencode(params, doseq=True)
-                original_url = urlunparse(('https', parsed.netloc, parsed.path, '', clean_query, ''))
-                # 清理临时目录
-                import shutil
-                if art_dir.exists():
-                    shutil.rmtree(art_dir, ignore_errors=True)
-                return download_single_article(original_url, out_dir, title_hint, _redirect_depth=_redirect_depth + 1)
-
-    except Exception as e:
+    if is_error:
         report_proxy_status(proxy_url, success=False)
-        return {"success": False, "title": safe_title, "error": f"获取页面失败: {str(e)}", "is_permanent": False}
+        return {"success": False, "title": safe_title, "error": error_msg, "is_permanent": is_permanent}
+
+    # 检测"阅读全文"跳转类型文章（转载/分享文章，js_content 为空，原文 URL 在 js_share_source 的 data-url 中）
+    share_source_match = re.search(r'data-url="([^"]+)"[^>]*id="js_share_source"', raw_html)
+    if not share_source_match:
+        share_source_match = re.search(r'id="js_share_source"[^>]*data-url="([^"]+)"', raw_html)
+    if share_source_match:
+        content_check = re.search(r'id="js_content"[^>]*>([\s\S]*?)</div>', raw_html)
+        content_is_empty = not content_check or not content_check.group(1).strip()
+        if content_is_empty and _redirect_depth < MAX_REDIRECT_DEPTH:
+            original_url = unescape(share_source_match.group(1))
+            original_url = clean_wechat_article_url(original_url)
+            if art_dir.exists():
+                shutil.rmtree(art_dir, ignore_errors=True)
+            return download_single_article(original_url, out_dir, title_hint, _redirect_depth=_redirect_depth + 1)
 
     # 提取封面 URL、描述和发布时间
     cover_url = ""
@@ -1171,6 +1420,7 @@ def download_single_article(url: str, out_dir: Path, title_hint: str = "", _redi
     return {
         "success": True,
         "title": safe_title,
+        "author": author or source,
         "path": str(art_dir),
         "resources": len(url_map),
         "cover_url": cover_url,
