@@ -63,6 +63,7 @@ from backend.xiaohongshu_login import xhs_login_bp
 from backend.bilibili import bilibili_bp
 from backend.bilibili_login import bilibili_login_bp
 from backend.updater import updater_bp
+from backend.waterwall import waterwall_bp
 
 # ── Flask 应用 ────────────────────────────────────────────
 static_folder_path = resource_dir() / "frontend"
@@ -92,6 +93,7 @@ app.register_blueprint(xhs_login_bp)
 app.register_blueprint(bilibili_bp)
 app.register_blueprint(bilibili_login_bp)
 app.register_blueprint(updater_bp)
+app.register_blueprint(waterwall_bp)
 
 
 # 账号池旧数据迁移

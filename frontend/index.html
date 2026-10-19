@@ -14,6 +14,8 @@
     <link rel="stylesheet" href="/css/style.css">
     <link rel="stylesheet" href="/css/dy-theme.css">
     <link rel="stylesheet" href="/css/wechat-theme.css">
+    <!-- 腾讯防水墙 (TCaptcha) 官方验证 SDK -->
+    <script src="https://captcha.gtimg.com/TCaptcha.js"></script>
 </head>
 <body>
     <div id="app">
@@ -347,7 +349,7 @@
                 </div>
                 <div class="sidebar-about" style="margin-top: 8px; padding-top: 8px; border-top: 1px solid var(--border-color); font-size: 0.75rem; text-align: center; color: var(--text-muted); display: flex; flex-direction: column; gap: 4px;">
                     <div id="version-display" style="cursor: pointer; position: relative; display: inline-flex; align-items: center; justify-content: center; gap: 4px;" onclick="App.showUpdateModal()">
-                        <span id="version-text">Media Tools v2.2.3</span>
+                        <span id="version-text">Media Tools v2.2.4</span>
                         <span id="update-dot" style="display: none; width: 8px; height: 8px; background: #ff3b30; border-radius: 50%; animation: pulse-dot 2s ease-in-out infinite;"></span>
                     </div>
                     <div style="display: flex; justify-content: center; gap: 12px;">
@@ -381,6 +383,7 @@
     <!-- JS 模块 -->
     <script src="/js/utils/toast.js"></script>
     <script src="/js/utils/modal.js"></script>
+    <script src="/js/utils/waterwall.js"></script>
     <script src="/js/api.js"></script>
     <script src="/js/components/login.js"></script>
     <script src="/js/components/accounts.js"></script>

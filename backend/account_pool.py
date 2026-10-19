@@ -650,6 +650,12 @@ def borrow_weread_session() -> tuple[str, str, str, dict]:
         "skey": skey,
         "Cookie": f"wr_vid={vid}; wr_skey={skey}",
     }
+    # 注入人工完成腾讯滑块验证后签发的微信读书安全票据 (wr_ticket & wr_randstr)
+    try:
+        from backend.waterwall import get_captcha_headers
+        headers.update(get_captcha_headers())
+    except Exception:
+        pass
     return account_id, vid, token, headers
 
 

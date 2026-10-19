@@ -1812,4 +1812,130 @@ body {
     box-shadow: 0 4px 12px var(--primary-glow);
 }
 
+/* ========================================================
+   腾讯防水墙 (TCaptcha) 拦截提示条
+   ======================================================== */
+#waterwall-banner {
+    position: fixed;
+    top: 16px;
+    left: 50%;
+    transform: translateX(-50%);
+    z-index: 9999;
+    display: flex;
+    align-items: center;
+    gap: 14px;
+    width: min(860px, calc(100vw - 32px));
+    padding: 14px 18px;
+    background: rgba(30, 24, 15, 0.95);
+    border: 1px solid rgba(245, 158, 11, 0.6);
+    border-radius: var(--radius-md, 10px);
+    box-shadow: 0 16px 40px -10px rgba(0, 0, 0, 0.65);
+    backdrop-filter: blur(14px);
+    animation: wwDrop 0.24s cubic-bezier(0.16, 1, 0.3, 1);
+}
+
+@keyframes wwDrop {
+    from { transform: translate(-50%, -16px); opacity: 0; }
+    to   { transform: translate(-50%, 0); opacity: 1; }
+}
+
+#waterwall-banner .ww-icon {
+    flex: 0 0 28px;
+    width: 28px;
+    height: 28px;
+    border-radius: 50%;
+    background: #f59e0b;
+    color: #1a1206;
+    font-size: 16px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+}
+
+#waterwall-banner .ww-body {
+    flex: 1;
+    min-width: 0;
+}
+
+#waterwall-banner .ww-title {
+    color: #fde68a;
+    font-size: 0.95rem;
+    font-weight: 600;
+    margin-bottom: 3px;
+}
+
+#waterwall-banner .ww-desc {
+    color: #e7d7b8;
+    font-size: 0.8rem;
+    line-height: 1.5;
+}
+
+#waterwall-banner .ww-actions {
+    display: flex;
+    gap: 8px;
+    flex: 0 0 auto;
+}
+
+#waterwall-banner .ww-btn {
+    border: 1px solid transparent;
+    border-radius: var(--radius-sm, 6px);
+    padding: 7px 14px;
+    font-size: 0.8rem;
+    font-family: inherit;
+    cursor: pointer;
+    white-space: nowrap;
+    transition: all 0.2s ease;
+}
+
+#waterwall-banner .ww-verify-now {
+    background: linear-gradient(135deg, #0284c7, #38bdf8);
+    color: #ffffff;
+    font-weight: 600;
+}
+
+#waterwall-banner .ww-verify-now:hover:not(:disabled) {
+    filter: brightness(1.15);
+    box-shadow: 0 0 12px rgba(56, 189, 248, 0.4);
+}
+
+#waterwall-banner .ww-retry {
+    background: #f59e0b;
+    color: #1a1206;
+    font-weight: 600;
+}
+
+#waterwall-banner .ww-retry:hover:not(:disabled) {
+    background: #fbbf24;
+}
+
+#waterwall-banner .ww-retry:disabled {
+    opacity: 0.6;
+    cursor: default;
+}
+
+#waterwall-banner .ww-ghost {
+    background: transparent;
+    border-color: rgba(253, 230, 138, 0.35);
+    color: #e7d7b8;
+}
+
+#waterwall-banner .ww-ghost:hover {
+    background: rgba(253, 230, 138, 0.15);
+}
+
+@media (max-width: 640px) {
+    #waterwall-banner {
+        flex-wrap: wrap;
+        gap: 10px;
+        padding: 12px 14px;
+    }
+    #waterwall-banner .ww-actions {
+        width: 100%;
+    }
+    #waterwall-banner .ww-btn {
+        flex: 1;
+    }
+}
+
+
 

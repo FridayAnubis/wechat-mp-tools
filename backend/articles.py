@@ -135,6 +135,15 @@ def _fetch_articles_page(fakeid: str, begin: int, count: int, keyword: str = "",
             try:
                 r = s.get(url, headers=h, timeout=10)
                 last_resp = r
+
+                # ── 优先检测腾讯防水墙 (TCaptcha) ──
+                from backend.waterwall import detect_waterwall, waterwall_hit, record_failure
+                ww_marker = detect_waterwall(r.status_code, r.text)
+                if ww_marker:
+                    record_failure(url, r.status_code, r.headers, r.text, ww_marker)
+                    waterwall_hit(url, r.status_code, ww_marker)
+                    return r, h, acc_id
+
                 if r.status_code == 401:
                     print(f"[_fetch_articles_page] 微信读书 401 Token 过期，触发自动静默续期 (第 {att+1} 次)...", flush=True)
                     account_pool.report(acc_id, status_code=401)
@@ -305,13 +314,19 @@ def get_articles(fakeid):
         )
         print(f"[Articles API] Fetch finished in {time.time() - t_start:.2f}s, got {len(articles)} articles", flush=True)
 
-        return jsonify({
+        from backend.waterwall import is_waterwall_active, waterwall_snapshot
+        res_data = {
             "articles": articles,
             "total": total_count,
             "can_msg_continue": can_continue,
             "begin": begin,
             "count": len(articles),
-        })
+        }
+        if is_waterwall_active():
+            res_data["need_verify"] = True
+            res_data["waterwall"] = waterwall_snapshot()
+
+        return jsonify(res_data)
 
     except PermissionError as e:
         print(f"[Articles API] PermissionError in {time.time() - t_start:.2f}s: {e}", flush=True)
@@ -320,7 +335,12 @@ def get_articles(fakeid):
         import traceback
         traceback.print_exc()
         print(f"[Articles API] Exception in {time.time() - t_start:.2f}s: {e}", flush=True)
-        return jsonify({"error": f"网络请求失败: {str(e)}", "articles": [], "total": 0, "count": 0}), 200
+        from backend.waterwall import is_waterwall_active, waterwall_snapshot
+        err_res = {"error": f"网络请求失败: {str(e)}", "articles": [], "total": 0, "count": 0}
+        if is_waterwall_active():
+            err_res["need_verify"] = True
+            err_res["waterwall"] = waterwall_snapshot()
+        return jsonify(err_res), 200
 
 
 @articles_bp.route("/list-via-appmsg/<fakeid>", methods=["GET"])

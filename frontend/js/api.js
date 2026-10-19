@@ -31,6 +31,11 @@ const API = {
 
             if (!resp.ok || !isJson) {
                 const errMsg = data.error || data.message || `HTTP ${resp.status}`;
+                if (data && (data.need_verify || data.waterwall)) {
+                    if (window.WaterWall && typeof WaterWall.handleDetection === 'function') {
+                        WaterWall.handleDetection(data.waterwall || data);
+                    }
+                }
                 if (showError) Toast.error(errMsg);
                 throw new Error(errMsg);
             }

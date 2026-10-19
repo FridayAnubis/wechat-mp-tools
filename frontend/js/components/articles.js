@@ -238,21 +238,41 @@ const ArticlesPage = {
             this.updatePagination();
             this.updateSelectedCount();
         } catch (err) {
-            const isAuthError = err.message && (err.message.includes('失效') || err.message.includes('未找到有效凭证') || err.message.includes('ret=-3') || err.message.includes('401') || err.message.includes('过期') || err.message.includes('会话'));
+            const isWaterwall = err.message && (err.message.includes('防水墙') || err.message.includes('安全验证') || err.message.includes('tcaptcha') || err.message.includes('人机验证'));
+            const isAuthError = !isWaterwall && err.message && (err.message.includes('失效') || err.message.includes('未找到有效凭证') || err.message.includes('ret=-3') || err.message.includes('401') || err.message.includes('过期') || err.message.includes('会话'));
             const accountName = this.currentAccount ? (this.currentAccount.nickname || '') : '';
-            container.innerHTML = `
-                <div class="empty-state" style="padding: 40px 20px;">
-                    <div style="font-size: 2.5rem; margin-bottom: 12px;">${isAuthError ? '🔐' : '⚠️'}</div>
-                    <h3 class="empty-state-title" style="margin-bottom: 8px;">${isAuthError ? (accountName ? `【${accountName}】尚未建立阅读会话` : '微信采集凭证已过期') : '加载文章列表失败'}</h3>
-                    <p class="empty-state-desc" style="max-width: 540px; margin: 0 auto 20px; line-height: 1.6; color: var(--text-secondary, #666);">
-                        ${isAuthError ? `微信 PC 客户端要求每个公众号首次抓取前建立独立阅读 Session（需打开公众号『主页』，仅点开文章不够）。<br>👉 <strong>方法 1</strong>：点击下方按钮，由系统自动在电脑微信中打开该号主页；<br>👉 <strong>方法 2</strong>：在电脑微信中进入该公众号任一文章 → 点击文章顶部的<strong>公众号名称/头像</strong>进入主页（出现历史文章列表即成功）。` : (err.message || '网络连接超时')}
-                    </p>
-                    <div style="display: flex; justify-content: center; gap: 10px; flex-wrap: wrap;">
-                        ${accountName ? `<button class="btn btn-primary" onclick="ArticlesPage.syncTargetAccount('${accountName}')">🤖 自动为【${accountName}】同步凭证</button>` : ''}
-                        <button class="btn btn-secondary" onclick="ArticlesPage.loadArticles()">🔄 重新检测并加载</button>
+            
+            if (isWaterwall) {
+                container.innerHTML = `
+                    <div class="empty-state" style="padding: 40px 20px;">
+                        <div style="font-size: 2.8rem; margin-bottom: 12px;">🛡️</div>
+                        <h3 class="empty-state-title" style="margin-bottom: 8px; color: #f59e0b;">触发腾讯安全验证（防水墙）</h3>
+                        <p class="empty-state-desc" style="max-width: 540px; margin: 0 auto 20px; line-height: 1.6; color: var(--text-secondary, #666);">
+                            微信读书上游接口检测到频率较高，触发了人机验证。<br>
+                            👉 <strong>方法 1（推荐）</strong>：点击下方按钮直接在网页中滑动完成验证码；<br>
+                            👉 <strong>方法 2</strong>：在手机微信读书 App 中打开任意书籍阅读片刻后，点击“已在手机处理”。
+                        </p>
+                        <div style="display: flex; justify-content: center; gap: 10px; flex-wrap: wrap;">
+                            <button class="btn btn-primary" onclick="WaterWall.triggerCaptcha({ onSuccess: () => ArticlesPage.loadArticles() })">🧩 立即网页滑动验证</button>
+                            <button class="btn btn-secondary" onclick="fetch('/api/waterwall/clear', {method:'POST'}).then(() => ArticlesPage.loadArticles())">✅ 已在App处理并重试</button>
+                        </div>
                     </div>
-                </div>
-            `;
+                `;
+            } else {
+                container.innerHTML = `
+                    <div class="empty-state" style="padding: 40px 20px;">
+                        <div style="font-size: 2.5rem; margin-bottom: 12px;">${isAuthError ? '🔐' : '⚠️'}</div>
+                        <h3 class="empty-state-title" style="margin-bottom: 8px;">${isAuthError ? (accountName ? `【${accountName}】尚未建立阅读会话` : '微信采集凭证已过期') : '加载文章列表失败'}</h3>
+                        <p class="empty-state-desc" style="max-width: 540px; margin: 0 auto 20px; line-height: 1.6; color: var(--text-secondary, #666);">
+                            ${isAuthError ? `微信 PC 客户端要求每个公众号首次抓取前建立独立阅读 Session（需打开公众号『主页』，仅点开文章不够）。<br>👉 <strong>方法 1</strong>：点击下方按钮，由系统自动在电脑微信中打开该号主页；<br>👉 <strong>方法 2</strong>：在电脑微信中进入该公众号任一文章 → 点击文章顶部的<strong>公众号名称/头像</strong>进入主页（出现历史文章列表即成功）。` : (err.message || '网络连接超时')}
+                        </p>
+                        <div style="display: flex; justify-content: center; gap: 10px; flex-wrap: wrap;">
+                            ${accountName ? `<button class="btn btn-primary" onclick="ArticlesPage.syncTargetAccount('${accountName}')">🤖 自动为【${accountName}】同步凭证</button>` : ''}
+                            <button class="btn btn-secondary" onclick="ArticlesPage.loadArticles()">🔄 重新检测并加载</button>
+                        </div>
+                    </div>
+                `;
+            }
         }
     },
 
