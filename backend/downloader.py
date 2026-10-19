@@ -1029,8 +1029,6 @@ def download_single_article(url: str, out_dir: Path, title_hint: str = "", _redi
 
     safe_title = sanitize(title_hint) if title_hint else "article"
     art_dir = out_dir / safe_title
-    media_dir = art_dir / "media"
-    media_dir.mkdir(parents=True, exist_ok=True)
 
     clean_url = clean_wechat_article_url(url)
     proxies = get_proxies_dict()
@@ -1038,6 +1036,8 @@ def download_single_article(url: str, out_dir: Path, title_hint: str = "", _redi
 
     raw_html, final_url, fetch_error = fetch_wechat_article_html(clean_url, review_id=review_id)
     if not raw_html:
+        if art_dir.exists():
+            shutil.rmtree(art_dir, ignore_errors=True)
         return {"success": False, "title": safe_title, "error": fetch_error or "获取页面失败", "is_permanent": False}
 
     # 检测是否为微信屏蔽、删除或出错页面（贴图画廊类型可能不含 js_content/js_article，但含有 picture_page_info_list）
@@ -1087,6 +1087,8 @@ def download_single_article(url: str, out_dir: Path, title_hint: str = "", _redi
             is_permanent = False
 
     if is_error:
+        if art_dir.exists():
+            shutil.rmtree(art_dir, ignore_errors=True)
         report_proxy_status(proxy_url, success=False)
         return {"success": False, "title": safe_title, "error": error_msg, "is_permanent": is_permanent}
 
@@ -1160,19 +1162,16 @@ def download_single_article(url: str, out_dir: Path, title_hint: str = "", _redi
 
     if page_title:
         safe_title = sanitize(page_title)
-        # 更新目录名，如果冲突则通过递增后缀消解
-        new_art_dir = out_dir / safe_title
-        if new_art_dir != art_dir:
-            counter = 1
-            while new_art_dir.exists() and new_art_dir != art_dir:
-                new_art_dir = out_dir / f"{safe_title}_{counter}"
-                counter += 1
 
-            if new_art_dir != art_dir:
-                art_dir.rename(new_art_dir)
-                art_dir = new_art_dir
-                media_dir = art_dir / "media"
-                media_dir.mkdir(parents=True, exist_ok=True)
+    art_dir = out_dir / safe_title
+    if art_dir.exists() and any(art_dir.glob("*.html")):
+        counter = 1
+        while (out_dir / f"{safe_title}_{counter}").exists() and any((out_dir / f"{safe_title}_{counter}").glob("*.html")):
+            counter += 1
+        art_dir = out_dir / f"{safe_title}_{counter}"
+
+    media_dir = art_dir / "media"
+    media_dir.mkdir(parents=True, exist_ok=True)
 
     # 提取正文区域
     content_html = extract_article_content(raw_html)

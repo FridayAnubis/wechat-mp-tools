@@ -2,7 +2,7 @@
 
 > [!TIP]
 > **开箱即用，无需配置本地 Python 开发环境！**
-> 本项目已通过 GitHub Actions 自动构建 Windows 与 macOS 双平台客户端。请直接前往 [👉 GitHub Releases 下载最新版本 (v2.2.2)](https://github.com/x554960766/wechat-mp-tools/releases)。
+> 本项目已通过 GitHub Actions 自动构建 Windows 与 macOS 双平台客户端。请直接前往 [👉 GitHub Releases 下载最新版本 (v2.2.3)](https://github.com/x554960766/wechat-mp-tools/releases)。
 
 ### 📦 安装包版本说明（Full 完整版 vs Lite 精简版）
 
@@ -103,6 +103,16 @@ python app.py    # 浏览器模式（访问 http://localhost:5200）
 ---
 
 ## 📝 更新日志 (Changelog)
+
+### v2.2.3 (2026-10-19)
+- **🛠️ 历史下载正文预览修复与定位增强**：
+  - 彻底解决微信公众号及 RSS 下载推文在“历史下载”中点击提示 `File not found` 404 错误的问题；
+  - 增强静态文件服务路由，支持 `?path=` 绝对路径与相对路径混合解析，并在目录内智能检索匹配文章 `.html` 正文；
+  - 适配自定义下载目录与默认 `data/articles_full` 双向查找与历史同步；
+  - 完善失败下载空目录（仅含空 `media/`）的安全清理机制，杜绝无效空文件夹残留。
+- **🚀 RSS 自动采集调度与客户端体验优化**：
+  - 统一 RSS 自动采集与主下载配置的 `download_dir` 设定，补齐历史记录公众号名称与链接查重校验；
+  - 完善客户端构建与版本发布，提升推文长短链转换及网络下载稳定性。
 
 ### v2.2.2 (2026-10-16)
 - **📱 微信公众号抓取底层升级与防风控验证码根治（核心重大优化）**：

@@ -18,7 +18,7 @@ from datetime import datetime
 from pathlib import Path
 
 from backend.config import (
-    CONFIG_FILE, BASE_URL, DEFAULT_HEADERS, OUTPUT_DIR,
+    CONFIG_FILE, BASE_URL, DEFAULT_HEADERS, OUTPUT_DIR, DATA_DIR,
     DOWNLOAD_HISTORY_FILE,
     load_json, save_json, get_settings, get_proxies_dict, report_proxy_status,
     normalize_wechat_url, get_default_wechat_ua
@@ -590,65 +590,88 @@ def get_download_status(task_id):
 
 
 def _sync_history_from_disk(history: list) -> bool:
-    """自动扫描本地下载文件夹，同步历史记录中缺失的条目"""
+    """自动扫描本地下载文件夹，同步历史记录中缺失的条目，并自动清理残存的无正文空目录"""
     settings = get_settings()
     download_dir = Path(settings.get("download_dir") or str(OUTPUT_DIR))
-    if not download_dir.exists():
+    
+    scan_dirs = []
+    if download_dir.exists():
+        scan_dirs.append(download_dir)
+    if OUTPUT_DIR.resolve() != download_dir.resolve() and OUTPUT_DIR.exists():
+        scan_dirs.append(OUTPUT_DIR)
+
+    if not scan_dirs:
         return False
 
     existing_paths = {item.get("path") for item in history if isinstance(item, dict) and item.get("path")}
     changed = False
 
     try:
-        for account_dir in download_dir.iterdir():
-            if not account_dir.is_dir() or account_dir.name in ("channels", "douyin_downloads", "xhs_downloads", "temp_uploads"):
-                continue
-
-            for art_dir in account_dir.iterdir():
-                if not art_dir.is_dir():
+        for sdir in scan_dirs:
+            for account_dir in sdir.iterdir():
+                if not account_dir.is_dir() or account_dir.name in ("channels", "douyin_downloads", "xhs_downloads", "temp_uploads"):
                     continue
 
-                art_path_str = str(art_dir)
-                if art_path_str in existing_paths:
-                    continue
+                for art_dir in account_dir.iterdir():
+                    if not art_dir.is_dir():
+                        continue
 
-                meta_file = art_dir / "metadata.json"
-                if not meta_file.exists():
-                    continue
-
-                try:
-                    meta = json.loads(meta_file.read_text(encoding="utf-8"))
-                    link = meta.get("url", "")
-                    mtime = art_dir.stat().st_mtime
-                    time_val = mtime
-                    if meta.get("time"):
+                    # 检查目录下是否存在 html 文件
+                    html_files = [f for f in art_dir.glob("*.html") if not f.name.endswith("_raw.html")]
+                    if not html_files:
+                        # 检查是否为失败下载遗留的空目录（仅有空 media 目录等），如果是则安全清理
                         try:
-                            # 尝试解析 2026-06-17T08:12:44 等标准 ISO 格式时间
-                            time_val = datetime.fromisoformat(meta["time"]).timestamp()
+                            has_files = any(f.is_file() for f in art_dir.rglob("*"))
+                            if not has_files:
+                                shutil.rmtree(art_dir, ignore_errors=True)
                         except Exception:
                             pass
+                        continue
 
-                    has_md = meta.get("has_markdown") if "has_markdown" in meta else (any(art_dir.glob("*.md")))
-                    has_pdf = meta.get("has_pdf") if "has_pdf" in meta else (any(art_dir.glob("*.pdf")))
-                    new_item = {
-                        "title": meta.get("title") or art_dir.name,
-                        "link": link,
-                        "account": account_dir.name,
-                        "success": True,
-                        "time": time_val,
-                        "error": None,
-                        "path": art_path_str,
-                        "cover_url": meta.get("cover_url", ""),
-                        "digest": meta.get("digest", ""),
-                        "publish_time": meta.get("publish_time") or int(time_val),
-                        "has_markdown": has_md,
-                        "has_pdf": has_pdf,
-                    }
-                    history.append(new_item)
-                    existing_paths.add(art_path_str)
-                    changed = True
-                except Exception:
-                    pass
+                    art_path_str = str(art_dir)
+                    if art_path_str in existing_paths:
+                        continue
+
+                    meta_file = art_dir / "metadata.json"
+                    meta = {}
+                    if meta_file.exists():
+                        try:
+                            meta = json.loads(meta_file.read_text(encoding="utf-8"))
+                        except Exception:
+                            meta = {}
+
+                    try:
+                        link = meta.get("url", "")
+                        mtime = art_dir.stat().st_mtime
+                        time_val = mtime
+                        if meta.get("time"):
+                            try:
+                                # 尝试解析 2026-06-17T08:12:44 等标准 ISO 格式时间
+                                time_val = datetime.fromisoformat(meta["time"]).timestamp()
+                            except Exception:
+                                pass
+
+                        has_md = meta.get("has_markdown") if "has_markdown" in meta else (any(art_dir.glob("*.md")))
+                        has_pdf = meta.get("has_pdf") if "has_pdf" in meta else (any(art_dir.glob("*.pdf")))
+                        new_item = {
+                            "title": meta.get("title") or art_dir.name,
+                            "link": link,
+                            "account": account_dir.name,
+                            "success": True,
+                            "time": time_val,
+                            "error": None,
+                            "path": art_path_str,
+                            "cover_url": meta.get("cover_url", ""),
+                            "digest": meta.get("digest", ""),
+                            "publish_time": meta.get("publish_time") or int(time_val),
+                            "has_markdown": has_md,
+                            "has_pdf": has_pdf,
+                        }
+                        history.append(new_item)
+                        existing_paths.add(art_path_str)
+                        changed = True
+                    except Exception:
+                        pass
     except Exception:
         pass
 
@@ -670,6 +693,8 @@ def get_history():
             if item.get("account") == "微信视频号":
                 continue
             indexed = dict(item)
+            if not indexed.get("account") and indexed.get("account_name"):
+                indexed["account"] = indexed["account_name"]
             indexed["_index"] = index
             indexed_history.append(indexed)
     indexed_history.sort(key=lambda x: x.get("time", 0), reverse=True)
@@ -773,7 +798,8 @@ def _do_batch_download(task_id: str, articles: list, account_name: str):
     delay = settings.get("request_delay", 0.8)
     max_retries = settings.get("max_retries", 3)
 
-    out_dir = OUTPUT_DIR / account_name
+    download_dir = Path(settings.get("download_dir") or str(OUTPUT_DIR))
+    out_dir = download_dir / account_name
     out_dir.mkdir(parents=True, exist_ok=True)
 
     history = load_json(DOWNLOAD_HISTORY_FILE, [])
@@ -889,7 +915,8 @@ def _download_article_into_task(task_id: str, article: dict, account_name: str, 
 
     settings = get_settings()
     max_retries = settings.get("max_retries", 3)
-    out_dir = OUTPUT_DIR / account_name
+    download_dir = Path(settings.get("download_dir") or str(OUTPUT_DIR))
+    out_dir = download_dir / account_name
     out_dir.mkdir(parents=True, exist_ok=True)
 
     link = article.get("link", "")
@@ -1180,31 +1207,124 @@ def open_parent():
         return jsonify({"error": f"打开失败: {str(e)}"}), 500
 
 
+@articles_bp.route("/serve-file", methods=["GET"])
 @articles_bp.route("/serve-file/<path:filepath>", methods=["GET"])
-def serve_file(filepath):
+def serve_file(filepath=""):
     """
-    Serve a file from the configured download directory.
+    Serve a file from the configured download directory or OUTPUT_DIR.
+    Supports ?path=<abs_or_rel_path> or /serve-file/<path:filepath>.
+    Auto-detects .html inside directory when folder path is provided or if filename differs slightly.
     """
-    from flask import send_from_directory
+    from flask import send_from_directory, Response
     from urllib.parse import unquote
     settings = get_settings()
-    download_dir = Path(settings.get("download_dir") or str(OUTPUT_DIR))
-    
-    try:
-        # Resolve target path safely
-        target_path = (download_dir / unquote(filepath)).resolve()
-        
-        # Check exists
-        if not target_path.exists():
-            return "File not found", 404
-            
-        # Security check: ensure path is within download_dir
-        if not str(target_path).startswith(str(download_dir.resolve())):
-            return "Access denied", 403
-            
-        return send_from_directory(target_path.parent, target_path.name)
-    except Exception as e:
-        return f"Error serving file: {str(e)}", 500
+    download_dir = Path(settings.get("download_dir") or str(OUTPUT_DIR)).resolve()
+    default_out_dir = OUTPUT_DIR.resolve()
+    data_dir = DATA_DIR.resolve()
+
+    allowed_roots = [str(download_dir), str(default_out_dir), str(data_dir)]
+
+    query_path = request.args.get("path", "").strip()
+    raw_path_str = query_path or filepath
+    if not raw_path_str:
+        return "File not found", 404
+
+    decoded_path_str = unquote(raw_path_str)
+
+    def is_safe_path(p: Path) -> bool:
+        p_res = str(p.resolve())
+        return any(p_res.startswith(root) for root in allowed_roots)
+
+    def find_html_in_dir(d: Path) -> Path | None:
+        if not d.exists() or not d.is_dir():
+            return None
+        candidates = [f for f in d.glob("*.html") if not f.name.endswith("_raw.html")]
+        if candidates:
+            for c in candidates:
+                if c.stem == d.name:
+                    return c
+            return candidates[0]
+        all_html = list(d.glob("*.html"))
+        if all_html:
+            return all_html[0]
+        return None
+
+    target_path = None
+
+    # 1. 尝试直接作为绝对路径
+    candidate_direct = Path(decoded_path_str)
+    if candidate_direct.is_absolute() and candidate_direct.exists():
+        if is_safe_path(candidate_direct):
+            if candidate_direct.is_dir():
+                target_path = find_html_in_dir(candidate_direct)
+            else:
+                target_path = candidate_direct
+
+    # 2. 尝试在 download_dir 或 default_out_dir 下查找
+    if not target_path or not target_path.exists():
+        for base_dir in [download_dir, default_out_dir]:
+            cand = (base_dir / decoded_path_str).resolve()
+            if is_safe_path(cand):
+                if cand.is_file():
+                    target_path = cand
+                    break
+                elif cand.is_dir():
+                    found = find_html_in_dir(cand)
+                    if found:
+                        target_path = found
+                        break
+                elif cand.parent.is_dir():
+                    found = find_html_in_dir(cand.parent)
+                    if found:
+                        target_path = found
+                        break
+
+    # 3. 尝试模糊跨账号查找（防止相对路径中缺少公众号目录）
+    if not target_path or not target_path.exists():
+        pure_name = Path(decoded_path_str).name
+        if pure_name.endswith(".html"):
+            pure_name = pure_name[:-5]
+        for base_dir in [download_dir, default_out_dir]:
+            if base_dir.exists():
+                for acc_dir in base_dir.iterdir():
+                    if acc_dir.is_dir() and acc_dir.name not in ("channels", "douyin_downloads", "xhs_downloads", "temp_uploads"):
+                        sub_cand = acc_dir / pure_name
+                        if sub_cand.is_dir() and is_safe_path(sub_cand):
+                            found = find_html_in_dir(sub_cand)
+                            if found:
+                                target_path = found
+                                break
+            if target_path:
+                break
+
+    if not target_path or not target_path.exists():
+        not_found_html = """<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="utf-8">
+    <style>
+        body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "PingFang SC", sans-serif; display: flex; flex-direction: column; align-items: center; justify-content: center; height: 80vh; margin: 0; color: #555; text-align: center; }
+        .icon { width: 56px; height: 56px; color: #f59e0b; margin-bottom: 16px; }
+        h3 { color: #111; margin: 0 0 8px 0; font-size: 1.15rem; }
+        p { margin: 0 0 16px 0; font-size: 0.9rem; max-width: 480px; line-height: 1.6; color: #666; }
+    </style>
+</head>
+<body>
+    <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+        <circle cx="12" cy="12" r="10"></circle>
+        <line x1="12" y1="8" x2="12" y2="12"></line>
+        <line x1="12" y1="16" x2="12.01" y2="16"></line>
+    </svg>
+    <h3>未找到本地文章正文文件 (File not found)</h3>
+    <p>该文章本地内容可能因网络异常尚未下载完成、或已被清理。您可以点击右上角“原文链接”查看微信在线正文。</p>
+</body>
+</html>"""
+        return Response(not_found_html, status=404, mimetype="text/html")
+
+    if not is_safe_path(target_path):
+        return "Access denied", 403
+
+    return send_from_directory(target_path.parent, target_path.name)
 
 
 @articles_bp.route("/rss", methods=["GET"])

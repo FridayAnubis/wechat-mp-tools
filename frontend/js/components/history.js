@@ -636,7 +636,16 @@ const HistoryPage = {
 
         if (markerIndex >= 0) {
             relativeDir = rawPath.slice(markerIndex + marker.length);
-        } else {
+        } else if (rawPath) {
+            const parts = rawPath.split('/').filter(Boolean);
+            if (parts.length >= 2) {
+                relativeDir = parts.slice(-2).join('/');
+            } else if (parts.length === 1) {
+                relativeDir = [item.account || '', parts[0]].filter(Boolean).join('/');
+            }
+        }
+
+        if (!relativeDir) {
             const parts = rawPath.split('/').filter(Boolean);
             const dirName = parts.length ? parts[parts.length - 1] : title;
             relativeDir = [item.account || '', dirName].filter(Boolean).join('/');
@@ -651,7 +660,8 @@ const HistoryPage = {
             .filter(Boolean)
             .map(segment => encodeURIComponent(segment))
             .join('/');
-        return `/api/articles/serve-file/${encodedDir}/${encodeURIComponent(filename)}`;
+        const queryParam = item.path ? `?path=${encodeURIComponent(item.path)}` : '';
+        return `/api/articles/serve-file/${encodedDir}/${encodeURIComponent(filename)}${queryParam}`;
     },
 
     /**
