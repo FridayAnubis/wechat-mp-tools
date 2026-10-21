@@ -138,8 +138,8 @@ printf '%s\n' '--- workflow variants ---'
 grep -nE 'runs-on:|matrix:|pyinstaller_arch|platform_machine|WECHAT_MP_TOOLS_TARGET_ARCH|verify_macos_bundle|WECHAT_MP_TOOLS_BUNDLE_BROWSER|pyinstaller|codesign|ditto|artifact' .github/workflows/build.yml
 printf '%s\n' '--- intended mac architecture branches ---'
 grep -nE 'macOS ARM64|macOS x86_64|architecture is (arm64|x86_64)|architecture check' docs/diagrams/build-flow.mmd
-printf '%s\n' '--- repository documentation tests ---'
-python3 -m pytest tests/test_architecture_docs.py tests/test_architecture_diagrams.py -q
+printf '%s\n' '--- build architecture tests ---'
+python3 -m pytest tests/test_build_architecture.py tests/test_verify_macos_bundle.py -q
 ```
 
 **预期观察**：`backend/transcode.py` 使用单 worker 队列避免并发 ffmpeg；macOS 可选 VideoToolbox，低码率源会强制 CRF 软编，输出变大时还有软件兜底压缩阶段。`wechat_mp_tools.spec` 至少包含 `frontend/` 与 `injection_scripts/`，Full 版包含 Playwright Chromium。workflow 当前产出 Windows Full/Lite、macOS ARM64 Full/Lite、macOS x86_64 Full/Lite；两个 macOS 架构都在原生 runner 上构建，并通过 `scripts/verify_macos_bundle.py` 检查主程序和原生扩展，Full 构建还以 `--require-chromium` 确认内置浏览器架构，Lite 构建不要求 Chromium。

@@ -141,7 +141,7 @@ class AccountPool:
 
     # ── 调度 ──────────────────────────────────────────
 
-    def acquire(self) -> dict | None:
+    def acquire(self, *, strict: bool = False) -> dict | None:
         """
         选出一个可用微信读书账号并返回其副本。
         支持冷却自愈与自动静默刷新。
@@ -157,8 +157,10 @@ class AccountPool:
                     acc["cooldown_until"] = 0
                     changed = True
 
-            active = [a for a in accounts if a.get("status") == "active"]
-            if not active:
+            active = [a for a in accounts if a.get("status") == "active"
+                      and (not strict or (a.get("cooldown_until", 0) <= now
+                                          and (a.get("accessToken") or a.get("token"))))]
+            if not active and not strict:
                 # 尝试自动刷新 invalid 账号（只要有 refreshToken）
                 invalid_with_rf = [a for a in accounts if a.get("refreshToken") and a.get("status") != "cooldown"]
                 for acc in invalid_with_rf:
@@ -170,7 +172,7 @@ class AccountPool:
             if not active:
                 # 若所有活跃账号均处于临时冷却中，取冷却剩余时间最短的账号兜底保活，避免阻断 mp/cover 等保底通道
                 cooldown_accs = [a for a in accounts if a.get("status") == "cooldown"]
-                if cooldown_accs:
+                if cooldown_accs and not strict:
                     cooldown_accs.sort(key=lambda a: a.get("cooldown_until", 0))
                     selected = cooldown_accs[0]
                     selected["last_used"] = now
@@ -200,9 +202,10 @@ class AccountPool:
 
     def report(self, account_id: str, *, ret: int | None = None,
                status_code: int | None = None, is_success: bool | None = None,
-               error_msg: str | None = None, need_refresh: bool = False):
+               error_msg: str | None = None, need_refresh: bool = False,
+               allow_refresh: bool = True):
         """
-        上报账号使用结果。遇到 401 自动触发静默刷新。
+        上报账号使用结果。allow_refresh=False 时只记录状态，不续期或激活会话。
         """
         now = time.time()
         with self._lock:
@@ -219,8 +222,9 @@ class AccountPool:
 
             # 处理 401 认证过期 / 显式请求刷新
             if status_code == 401 or ret in (401, -2012) or need_refresh:
-                logger.info("账号 [%s] 认证过期，正在执行自动静默续期...", acc.get("nickname"))
-                refreshed = self._refresh_account_locked(acc)
+                if allow_refresh:
+                    logger.info("账号 [%s] 认证过期，正在执行自动静默续期...", acc.get("nickname"))
+                refreshed = allow_refresh and self._refresh_account_locked(acc)
                 if refreshed:
                     logger.info("账号 [%s] 静默续期成功！", acc.get("nickname"))
                     self._save(accounts)
@@ -237,7 +241,7 @@ class AccountPool:
                     return
 
             # 处理 499 -2041 会话未激活：自动发起 mobileSync 激活会话
-            if ret == -2041 or (status_code == 499 and "2041" in str(error_msg or "")):
+            if allow_refresh and (ret == -2041 or (status_code == 499 and "2041" in str(error_msg or ""))):
                 try:
                     from backend.weread_signer import activate_terminal_session
                     h = {
@@ -629,12 +633,12 @@ class AccountPool:
 account_pool = AccountPool()
 
 
-def borrow_weread_session() -> tuple[str, str, str, dict]:
+def borrow_weread_session(*, strict: bool = False) -> tuple[str, str, str, dict]:
     """
     调度可用账号，返回 (account_id, vid, accessToken, auth_headers)。
     遇到无可用账号抛出 RuntimeError。
     """
-    acc = account_pool.acquire()
+    acc = account_pool.acquire(strict=strict)
     if not acc:
         raise RuntimeError("微信读书账号池中暂无可用账号，请先在『账号池』页面扫码登录")
     account_id = acc["id"]
