@@ -1419,7 +1419,8 @@ def download_single_article(url: str, out_dir: Path, title_hint: str = "", _redi
     return {
         "success": True,
         "title": safe_title,
-        "author": author or source,
+        "source": source,  # 公众号名称
+        "author": author,  # 文章署名（这个经常与公众号名称不同）
         "path": str(art_dir),
         "resources": len(url_map),
         "cover_url": cover_url,

@@ -885,12 +885,16 @@ def _do_batch_download(task_id: str, articles: list, account_name: str):
                         "title": title, "success": False, "error": error_msg
                     })
 
-            real_account = result.get("author") or (account_name if account_name != "url_download" else "链接下载")
+            # 这里改为按照发布文章的公众号分组，而不是之前的署名作者
+            real_account = result.get("source")
+            if not real_account or real_account == "url_download":
+                real_account = account_name if account_name != "url_download" else "链接下载"
             # 记录到下载历史
             history.append({
                 "title": title,
                 "link": article.get("original_url") or link,
                 "account": real_account,
+                "author": result.get("author", ""),
                 "success": success,
                 "time": time.time(),
                 "error": error_msg if not success else None,
@@ -1374,23 +1378,26 @@ def get_rss(account=None):
     # Merge auto-fetched RSS articles
     try:
         from backend.rss_scheduler import rss_scheduler
+        # 同上，改为公众号分组
         if account:
-            rss_arts = rss_scheduler.get_articles(account)
+            rss_arts = [(account, art) for art in rss_scheduler.get_articles(account)]
         else:
             # Get articles from all subscriptions
             rss_arts = []
             for sub in rss_scheduler.get_subscriptions():
-                rss_arts.extend(rss_scheduler.get_articles(sub.get("nickname", "")))
+                nickname = sub.get("nickname", "")
+                rss_arts.extend((nickname, art) for art in rss_scheduler.get_articles(nickname))
 
         # Convert auto-fetched articles to the same format, dedup by link
         existing_links = {item.get("link") for item in items if item.get("link")}
-        for art in rss_arts:
+        for nickname, art in rss_arts:
             link = art.get("link", "")
             if link and link not in existing_links:
                 items.append({
                     "title": art.get("title", ""),
                     "link": link,
-                    "account": account or art.get("author", ""),
+                    "account": nickname,
+                    "author": art.get("author", ""),
                     "success": True,
                     "time": art.get("update_time", 0),
                     "publish_time": art.get("update_time", 0),
@@ -1464,12 +1471,20 @@ def get_rss(account=None):
                 
         enclosure = f'<enclosure url="{cover_url}" type="image/jpeg" length="0"/>' if cover_url else ""
         
+        # 文章署名单独输出为 dc:creator，不参与订阅分组
+        author_val = item.get("author") or ""
+        if not author_val and path_str:
+            meta = load_json(Path(path_str) / "metadata.json", {})
+            author_val = meta.get("author", "") if isinstance(meta, dict) else ""
+        creator = f"<dc:creator>{html.escape(str(author_val))}</dc:creator>" if author_val else ""
+
         xml_items.append(f"""    <item>
       <title>{title}</title>
       <link>{xml_link}</link>
       <guid isPermaLink="false">{orig_url or xml_link}</guid>
       <pubDate>{pub_date}</pubDate>
       <description>{digest}</description>
+      {creator}
       {enclosure}
       {content_encoded}
     </item>""")
@@ -1477,7 +1492,7 @@ def get_rss(account=None):
     items_str = "\n".join(xml_items)
     
     rss_xml = f"""<?xml version="1.0" encoding="utf-8"?>
-<rss version="2.0" xmlns:content="http://purl.org/rss/1.0/modules/content/">
+<rss version="2.0" xmlns:content="http://purl.org/rss/1.0/modules/content/" xmlns:dc="http://purl.org/dc/elements/1.1/">
   <channel>
     <title>{html.escape(feed_title)}</title>
     <link>{host_url}</link>
