@@ -34,6 +34,9 @@ douyin_bp = Blueprint("douyin", __name__, url_prefix="/api/douyin")
 # 抖音下载保存的主目录
 DOUYIN_DIR = DATA_DIR / "douyin_downloads"
 HISTORY_FILE = DATA_DIR / "douyin_history.json"
+# 批量下载断点续传进度记录（按任务键持久化已下载的作品 ID）
+PROGRESS_FILE = DATA_DIR / "douyin_progress.json"
+_progress_lock = threading.Lock()
 
 # ── 常量 ──────────────────────────────────────────────────
 
@@ -185,6 +188,57 @@ def add_history_item(title: str, item_type: str, file_path: str, size_bytes: int
         "time": time.strftime("%Y-%m-%d %H:%M:%S")
     })
     save_json(HISTORY_FILE, history[:150])
+
+
+# ── 断点续传进度记录 ──────────────────────────────────────
+
+def _progress_downloaded_ids(key: str) -> list:
+    """读取某个任务键下已下载的作品 ID 列表（如 post:<sec_uid> / mix:<mix_id>）"""
+    if not key:
+        return []
+    with _progress_lock:
+        entry = load_json(PROGRESS_FILE, {}).get(key) or {}
+        ids = entry.get("downloaded") or []
+        return list(ids) if isinstance(ids, list) else []
+
+
+def _progress_mark(key: str, aweme_id: str):
+    """将一个作品标记为已下载并立即持久化（断点续传依据之一，磁盘文件存在性检查兜底）"""
+    if not key or not aweme_id or aweme_id == "unknown":
+        return
+    with _progress_lock:
+        data = load_json(PROGRESS_FILE, {})
+        if not isinstance(data, dict):
+            data = {}
+        entry = data.get(key)
+        if not isinstance(entry, dict):
+            entry = {}
+        ids = entry.get("downloaded")
+        if not isinstance(ids, list):
+            ids = []
+        if aweme_id not in ids:
+            ids.append(aweme_id)
+            entry["downloaded"] = ids
+            entry["updated"] = time.strftime("%Y-%m-%d %H:%M:%S")
+            data[key] = entry
+            save_json(PROGRESS_FILE, data)
+
+
+def _log_resume_status(task_label: str, all_items: list, progress_key: str):
+    """批量任务收集完列表后，提示检测到的历史下载进度"""
+    if not progress_key:
+        return
+    existing_ids = _progress_downloaded_ids(progress_key)
+    if not existing_ids:
+        return
+    id_set = set(existing_ids)
+    matched = 0
+    for item in all_items:
+        mid = str(item.get("aweme_id") or item.get("awemeId") or "")
+        if mid and mid in id_set:
+            matched += 1
+    if matched > 0:
+        _add_log(f"📂 {task_label}检测到历史下载进度：{matched} 个作品已下载过，将自动跳过并从上次进度继续")
 
 
 # ── 抖音 API 客户端 ──────────────────────────────────────
@@ -2018,8 +2072,14 @@ def download_file(url: str, save_path: Path) -> int:
     raise last_error or Exception("下载流读取失败: unexpected EOF")
 
 
-def download_media(media_info: dict, target_dir: Path, custom_dir: Path = None) -> dict:
-    """根据解析的媒体信息执行下载"""
+def download_media(media_info: dict, target_dir: Path, custom_dir: Path = None,
+                   skip_existing: bool = False, progress_key: str = "") -> dict:
+    """根据解析的媒体信息执行下载
+
+    skip_existing=True 时启用断点续传：目标文件/图集已完整存在于磁盘则跳过下载
+    （用于批量任务重启后从上次进度继续）；单条下载保持默认覆盖重新下载。
+    progress_key 非空时，会把已下载的作品 ID 记入持久化进度文件。
+    """
     aweme_id = media_info["aweme_id"]
     title = media_info["title"]
     item_type = media_info["type"]
@@ -2048,16 +2108,46 @@ def download_media(media_info: dict, target_dir: Path, custom_dir: Path = None) 
         else:
             save_file = user_dir / f"{title_with_id}.mp4"
 
+        if skip_existing and save_file.exists() and save_file.stat().st_size > 0:
+            _add_log(f"⏭️ 已下载过，跳过: {save_file.name}")
+            _progress_mark(progress_key, aweme_id)
+            return {
+                "id": aweme_id,
+                "title": title,
+                "type": "replay" if is_replay else item_type,
+                "size_bytes": 0,
+                "skipped": True,
+            }
+
         _add_log(f"🎬 正在下载{type_label}: {save_file.name}")
         total_bytes = download_file(urls[0], save_file)
         _add_log(f"✅ {type_label}下载完成! 大小: {total_bytes / (1024 * 1024):.2f} MB")
         add_history_item(title, history_type, save_file, total_bytes)
+        _progress_mark(progress_key, aweme_id)
     else:
         folder_path = user_dir / title_with_id
         folder_path.mkdir(parents=True, exist_ok=True)
+
+        # 图集断点续传：文件夹内图片数量已达到预期张数则整个跳过
+        if skip_existing:
+            existing_imgs = len(list(folder_path.glob("*.jpeg")))
+            if existing_imgs >= len(urls):
+                _add_log(f"⏭️ 图集已下载过，跳过: {folder_path.name}")
+                _progress_mark(progress_key, aweme_id)
+                return {
+                    "id": aweme_id,
+                    "title": title,
+                    "type": item_type,
+                    "size_bytes": 0,
+                    "skipped": True,
+                }
+
         _add_log(f"📸 正在下载图集 (共 {len(urls)} 张) 到目录: {folder_path.name}")
         for idx, img_url in enumerate(urls, 1):
             save_file = folder_path / f"{idx}.jpeg"
+            if skip_existing and save_file.exists() and save_file.stat().st_size > 0:
+                total_bytes += save_file.stat().st_size
+                continue
             img_bytes = download_file(img_url, save_file)
             total_bytes += img_bytes
 
@@ -2067,6 +2157,9 @@ def download_media(media_info: dict, target_dir: Path, custom_dir: Path = None) 
             if live_url:
                 try:
                     live_file = folder_path / f"{idx}_live.mp4"
+                    if skip_existing and live_file.exists() and live_file.stat().st_size > 0:
+                        total_bytes += live_file.stat().st_size
+                        continue
                     _add_log(f"🎬 发现第 {idx} 张为实况照片，正在下载动态视频...")
                     live_bytes = download_file(live_url, live_file)
                     total_bytes += live_bytes
@@ -2079,16 +2172,18 @@ def download_media(media_info: dict, target_dir: Path, custom_dir: Path = None) 
         # 下载图文背景音乐 (BGM)
         music_url = media_info.get("music_url")
         if music_url:
-            _add_log("🎵 发现图文背景音乐，正在下载...")
-            try:
-                save_music = folder_path / "bgm.mp3"
-                music_bytes = download_file(music_url, save_music)
-                total_bytes += music_bytes
-                _add_log(f"✅ 背景音乐下载成功! 大小: {music_bytes / (1024 * 1024):.2f} MB")
-            except Exception as me:
-                _add_log(f"⚠️ 背景音乐下载失败: {me}")
+            save_music = folder_path / "bgm.mp3"
+            if not (skip_existing and save_music.exists() and save_music.stat().st_size > 0):
+                _add_log("🎵 发现图文背景音乐，正在下载...")
+                try:
+                    music_bytes = download_file(music_url, save_music)
+                    total_bytes += music_bytes
+                    _add_log(f"✅ 背景音乐下载成功! 大小: {music_bytes / (1024 * 1024):.2f} MB")
+                except Exception as me:
+                    _add_log(f"⚠️ 背景音乐下载失败: {me}")
 
         add_history_item(title, "图文", folder_path, total_bytes)
+        _progress_mark(progress_key, aweme_id)
 
     return {
         "id": aweme_id,
@@ -2312,11 +2407,14 @@ def _run_profile_download_task(sec_uid: str, max_pages: int, target_dir: Path):
             _add_log("❌ 未能获取到任何作品数据，请确认用户主页链接正确")
             return
 
+        progress_key = f"profile:{sec_uid}"
+        _log_resume_status("主页批量任务", all_items, progress_key)
         _add_log(f"🚀 作品列表获取完成！共 {len(all_items)} 个作品待处理")
         _reset_task_state(total=len(all_items))
 
         # 第二步：逐个下载
         downloaded = 0
+        skipped = 0
         failed = 0
 
         for idx, item in enumerate(all_items, 1):
@@ -2337,7 +2435,10 @@ def _run_profile_download_task(sec_uid: str, max_pages: int, target_dir: Path):
                     continue
 
                 _add_log(f"[{idx}/{len(all_items)}] 正在下载: {media_info['title'][:30]}...")
-                result = download_media(media_info, target_dir, custom_dir=profile_dir)
+                result = download_media(media_info, target_dir, custom_dir=profile_dir,
+                                        skip_existing=True, progress_key=progress_key)
+                if result.get("skipped"):
+                    skipped += 1
                 downloaded += 1
                 _set_task_state(downloaded_count=downloaded, current_title=result["title"])
             except Exception as e:
@@ -2350,7 +2451,7 @@ def _run_profile_download_task(sec_uid: str, max_pages: int, target_dir: Path):
                 delay = random.uniform(1.0, 3.0)
                 time.sleep(delay)
 
-        _add_log(f"🎉 批量下载任务结束! 成功: {downloaded}，失败: {failed}")
+        _add_log(f"🎉 批量下载任务结束! 成功: {downloaded - skipped}，跳过已下载: {skipped}，失败: {failed}")
         add_history_item(f"{nickname}的作品", "批量", profile_dir, downloaded)
         _set_task_state(status="completed")
 
@@ -2422,11 +2523,14 @@ def _run_mix_download_task(mix_id: str, target_dir: Path):
             return
 
         mix_name = clean_filename(mix_name or f"合集_{mix_id}")
+        progress_key = f"mix:{mix_id}"
+        _log_resume_status(f"合集 「{mix_name}」", all_items, progress_key)
         _add_log(f"🚀 合集列表获取完成！合集名称: {mix_name}，共 {len(all_items)} 个作品待处理")
         _reset_task_state(total=len(all_items))
 
         # 第二步：逐个下载
         downloaded = 0
+        skipped = 0
         failed = 0
 
         # 获取作者昵称
@@ -2457,7 +2561,10 @@ def _run_mix_download_task(mix_id: str, target_dir: Path):
                     continue
 
                 _add_log(f"[{idx}/{len(all_items)}] 正在下载: {media_info['title'][:30]}...")
-                result = download_media(media_info, target_dir, custom_dir=mix_dir)
+                result = download_media(media_info, target_dir, custom_dir=mix_dir,
+                                        skip_existing=True, progress_key=progress_key)
+                if result.get("skipped"):
+                    skipped += 1
                 downloaded += 1
                 _set_task_state(downloaded_count=downloaded, current_title=result["title"])
             except Exception as e:
@@ -2470,7 +2577,7 @@ def _run_mix_download_task(mix_id: str, target_dir: Path):
                 delay = random.uniform(1.0, 3.0)
                 time.sleep(delay)
 
-        _add_log(f"🎉 批量下载合集任务结束! 成功: {downloaded}，失败: {failed}")
+        _add_log(f"🎉 批量下载合集任务结束! 成功: {downloaded - skipped}，跳过已下载: {skipped}，失败: {failed}")
         add_history_item(mix_name, "合集", mix_dir, 0)
         _set_task_state(status="completed")
 
@@ -2535,9 +2642,12 @@ def _run_user_download_task(sec_uid: str, types: list, max_pages: int, target_di
                 time.sleep(random.uniform(1.0, 2.5))
 
             if all_items:
+                post_key = f"post:{sec_uid}"
+                _log_resume_status("作品批量任务", all_items, post_key)
                 _add_log(f"作品列表获取完成！共 {len(all_items)} 个作品待下载。")
                 _reset_task_state(total=len(all_items))
                 downloaded = 0
+                skipped = 0
                 failed = 0
                 for idx, item in enumerate(all_items, 1):
                     if _task_cancel_event.is_set():
@@ -2548,7 +2658,10 @@ def _run_user_download_task(sec_uid: str, types: list, max_pages: int, target_di
                     try:
                         media_info = DouyinClient.parse_media_info(item)
                         _add_log(f"[{idx}/{len(all_items)}] 正在下载作品: {media_info['title'][:30]}")
-                        result = download_media(media_info, target_dir, custom_dir=target_dir / nickname)
+                        result = download_media(media_info, target_dir, custom_dir=target_dir / nickname,
+                                                skip_existing=True, progress_key=post_key)
+                        if result.get("skipped"):
+                            skipped += 1
                         downloaded += 1
                         _set_task_state(downloaded_count=downloaded, current_title=result["title"])
                     except Exception as e:
@@ -2564,7 +2677,7 @@ def _run_user_download_task(sec_uid: str, types: list, max_pages: int, target_di
                         _set_task_state(status="cancelled")
                         return
                     time.sleep(random.uniform(0.3, 0.8))
-                _add_log(f"🎉 博主作品下载结束! 成功: {downloaded}，失败: {failed}")
+                _add_log(f"🎉 博主作品下载结束! 成功: {downloaded - skipped}，跳过已下载: {skipped}，失败: {failed}")
                 add_history_item(f"{nickname}的作品", "批量", target_dir / nickname, downloaded)
             else:
                 _add_log("该博主作品列表为空或获取失败。")
@@ -2608,9 +2721,13 @@ def _run_user_download_task(sec_uid: str, types: list, max_pages: int, target_di
                 time.sleep(random.uniform(1.0, 2.5))
 
             if all_items:
+                like_dir = target_dir / f"{nickname}的喜欢"
+                like_key = f"like:{sec_uid}"
+                _log_resume_status("喜欢批量任务", all_items, like_key)
                 _add_log(f"喜欢列表获取完成！共 {len(all_items)} 个作品待下载。")
                 _reset_task_state(total=len(all_items))
                 downloaded = 0
+                skipped = 0
                 failed = 0
                 for idx, item in enumerate(all_items, 1):
                     if _task_cancel_event.is_set():
@@ -2621,7 +2738,10 @@ def _run_user_download_task(sec_uid: str, types: list, max_pages: int, target_di
                     try:
                         media_info = DouyinClient.parse_media_info(item)
                         _add_log(f"[{idx}/{len(all_items)}] 正在下载喜欢: {media_info['title'][:30]}")
-                        result = download_media(media_info, target_dir, custom_dir=target_dir / f"{nickname}的喜欢")
+                        result = download_media(media_info, target_dir, custom_dir=like_dir,
+                                                skip_existing=True, progress_key=like_key)
+                        if result.get("skipped"):
+                            skipped += 1
                         downloaded += 1
                         _set_task_state(downloaded_count=downloaded, current_title=result["title"])
                     except Exception as e:
@@ -2629,8 +2749,7 @@ def _run_user_download_task(sec_uid: str, types: list, max_pages: int, target_di
                         _set_task_state(failed_count=failed)
                         _add_log(f"❌ 第 {idx} 项喜欢下载失败: {e}")
                     time.sleep(random.uniform(0.5, 1.5))
-                _add_log(f"🎉 博主喜欢下载结束! 成功: {downloaded}，失败: {failed}")
-                add_history_item(f"{nickname}的喜欢", "批量", target_dir / f"{nickname}的喜欢", downloaded)
+                _add_log(f"🎉 博主喜欢下载结束! 成功: {downloaded - skipped}，跳过已下载: {skipped}，失败: {failed}")
                 add_history_item(f"{nickname}的喜欢", "批量", like_dir, downloaded)
                 _set_task_state(last_saved_path=str(like_dir))
             else:
@@ -2682,8 +2801,11 @@ def _run_user_download_task(sec_uid: str, types: list, max_pages: int, target_di
                             break
 
                     if mix_items:
+                        mix_key = f"mix:{mix_id}"
+                        _log_resume_status(f"合集 「{mix_name}」", mix_items, mix_key)
                         _reset_task_state(total=len(mix_items))
                         downloaded = 0
+                        skipped = 0
                         failed = 0
                         mix_dir = target_dir / nickname / f"合集_{clean_filename(mix_name)}"
                         mix_dir.mkdir(parents=True, exist_ok=True)
@@ -2696,7 +2818,10 @@ def _run_user_download_task(sec_uid: str, types: list, max_pages: int, target_di
                             try:
                                 media_info = DouyinClient.parse_media_info(item)
                                 _add_log(f"[{idx}/{len(mix_items)}] 正在下载合集视频: {media_info['title'][:30]}")
-                                result = download_media(media_info, target_dir, custom_dir=mix_dir)
+                                result = download_media(media_info, target_dir, custom_dir=mix_dir,
+                                                        skip_existing=True, progress_key=mix_key)
+                                if result.get("skipped"):
+                                    skipped += 1
                                 downloaded += 1
                                 _set_task_state(downloaded_count=downloaded, current_title=result["title"], last_saved_path=str(mix_dir))
                             except Exception as e:
@@ -2704,7 +2829,7 @@ def _run_user_download_task(sec_uid: str, types: list, max_pages: int, target_di
                                 _set_task_state(failed_count=failed)
                                 _add_log(f"❌ 下载失败: {e}")
                             time.sleep(random.uniform(0.5, 1.5))
-                        _add_log(f"🎉 合集 「{mix_name}」 下载结束! 成功: {downloaded}，失败: {failed}")
+                        _add_log(f"🎉 合集 「{mix_name}」 下载结束! 成功: {downloaded - skipped}，跳过已下载: {skipped}，失败: {failed}")
                         add_history_item(mix_name, "合集", mix_dir, downloaded)
             else:
                 _add_log("该博主未创建任何合集。")
@@ -2741,9 +2866,12 @@ def _run_user_download_task(sec_uid: str, types: list, max_pages: int, target_di
                 time.sleep(random.uniform(1.0, 2.5))
 
             if all_items:
+                story_key = f"story:{sec_uid}"
+                _log_resume_status("日常批量任务", all_items, story_key)
                 _add_log(f"日常列表获取完成！共 {len(all_items)} 个日常待下载。")
                 _reset_task_state(total=len(all_items))
                 downloaded = 0
+                skipped = 0
                 failed = 0
                 for idx, item in enumerate(all_items, 1):
                     if _task_cancel_event.is_set():
@@ -2754,7 +2882,10 @@ def _run_user_download_task(sec_uid: str, types: list, max_pages: int, target_di
                     try:
                         media_info = DouyinClient.parse_media_info(item)
                         _add_log(f"[{idx}/{len(all_items)}] 正在下载日常: {media_info['title'][:30]}")
-                        result = download_media(media_info, target_dir, custom_dir=target_dir / f"{nickname}的日常")
+                        result = download_media(media_info, target_dir, custom_dir=target_dir / f"{nickname}的日常",
+                                                skip_existing=True, progress_key=story_key)
+                        if result.get("skipped"):
+                            skipped += 1
                         downloaded += 1
                         _set_task_state(downloaded_count=downloaded, current_title=result["title"])
                     except Exception as e:
@@ -2762,7 +2893,7 @@ def _run_user_download_task(sec_uid: str, types: list, max_pages: int, target_di
                         _set_task_state(failed_count=failed)
                         _add_log(f"❌ 第 {idx} 项日常下载失败: {e}")
                     time.sleep(random.uniform(0.5, 1.5))
-                _add_log(f"🎉 博主日常下载结束! 成功: {downloaded}，失败: {failed}")
+                _add_log(f"🎉 博主日常下载结束! 成功: {downloaded - skipped}，跳过已下载: {skipped}，失败: {failed}")
                 add_history_item(f"{nickname}的日常", "批量", target_dir / f"{nickname}的日常", downloaded)
             else:
                 _add_log("该博主日常列表为空或获取失败。")
@@ -2802,9 +2933,12 @@ def _run_user_download_task(sec_uid: str, types: list, max_pages: int, target_di
                 time.sleep(random.uniform(1.0, 2.5))
 
             if all_items:
+                collect_key = f"collect:{sec_uid}"
+                _log_resume_status("收藏批量任务", all_items, collect_key)
                 _add_log(f"收藏列表获取完成！共 {len(all_items)} 个作品待下载。")
                 _reset_task_state(total=len(all_items))
                 downloaded = 0
+                skipped = 0
                 failed = 0
                 collect_dir = target_dir / f"{nickname}的收藏"
                 collect_dir.mkdir(parents=True, exist_ok=True)
@@ -2817,7 +2951,10 @@ def _run_user_download_task(sec_uid: str, types: list, max_pages: int, target_di
                     try:
                         media_info = DouyinClient.parse_media_info(item)
                         _add_log(f"[{idx}/{len(all_items)}] 正在下载收藏: {media_info['title'][:30]}")
-                        result = download_media(media_info, target_dir, custom_dir=collect_dir)
+                        result = download_media(media_info, target_dir, custom_dir=collect_dir,
+                                                skip_existing=True, progress_key=collect_key)
+                        if result.get("skipped"):
+                            skipped += 1
                         downloaded += 1
                         _set_task_state(downloaded_count=downloaded, current_title=result["title"])
                     except Exception as e:
@@ -2825,7 +2962,7 @@ def _run_user_download_task(sec_uid: str, types: list, max_pages: int, target_di
                         _set_task_state(failed_count=failed)
                         _add_log(f"❌ 第 {idx} 项收藏下载失败: {e}")
                     time.sleep(random.uniform(0.5, 1.5))
-                _add_log(f"🎉 个人收藏下载结束! 成功: {downloaded}，失败: {failed}")
+                _add_log(f"🎉 个人收藏下载结束! 成功: {downloaded - skipped}，跳过已下载: {skipped}，失败: {failed}")
                 add_history_item(f"{nickname}的收藏", "批量", collect_dir, downloaded)
                 _set_task_state(last_saved_path=str(collect_dir))
             else:
@@ -2863,9 +3000,12 @@ def _run_user_download_task(sec_uid: str, types: list, max_pages: int, target_di
                 time.sleep(random.uniform(1.0, 2.5))
 
             if all_items:
+                replay_key = f"replay:{sec_uid}"
+                _log_resume_status("直播回放批量任务", all_items, replay_key)
                 _add_log(f"直播回放列表获取完成！共 {len(all_items)} 个回放待下载。")
                 _reset_task_state(total=len(all_items))
                 downloaded = 0
+                skipped = 0
                 failed = 0
                 replay_dir = target_dir / f"{nickname}的直播回放"
                 replay_dir.mkdir(parents=True, exist_ok=True)
@@ -2879,7 +3019,10 @@ def _run_user_download_task(sec_uid: str, types: list, max_pages: int, target_di
                         media_info = DouyinClient.parse_media_info(item)
                         media_info["is_replay"] = True
                         _add_log(f"[{idx}/{len(all_items)}] 正在下载直播回放: {media_info['title'][:30]}")
-                        result = download_media(media_info, target_dir, custom_dir=replay_dir)
+                        result = download_media(media_info, target_dir, custom_dir=replay_dir,
+                                                skip_existing=True, progress_key=replay_key)
+                        if result.get("skipped"):
+                            skipped += 1
                         downloaded += 1
                         _set_task_state(downloaded_count=downloaded, current_title=result["title"], last_saved_path=str(replay_dir))
                     except Exception as e:
@@ -2887,7 +3030,7 @@ def _run_user_download_task(sec_uid: str, types: list, max_pages: int, target_di
                         _set_task_state(failed_count=failed)
                         _add_log(f"❌ 第 {idx} 项直播回放下载失败: {e}")
                     time.sleep(random.uniform(0.5, 1.5))
-                _add_log(f"🎉 博主直播回放下载结束! 成功: {downloaded}，失败: {failed}")
+                _add_log(f"🎉 博主直播回放下载结束! 成功: {downloaded - skipped}，跳过已下载: {skipped}，失败: {failed}")
                 add_history_item(f"{nickname}的直播回放", "批量", replay_dir, downloaded)
                 _set_task_state(last_saved_path=str(replay_dir))
             else:
@@ -2983,11 +3126,14 @@ def _run_liked_download_task(sec_uid: str, max_pages: int, target_dir: Path):
             _add_log("❌ 未能获取到任何点赞作品数据，请确认登录状态或链接")
             return
 
+        liked_key = f"like:{sec_uid}" if sec_uid else "like:self"
+        _log_resume_status("点赞批量任务", all_items, liked_key)
         _add_log(f"🚀 点赞作品列表获取完成！共 {len(all_items)} 个作品待处理")
         _reset_task_state(total=len(all_items))
 
         # 第二步：逐个下载
         downloaded = 0
+        skipped = 0
         failed = 0
 
         for idx, item in enumerate(all_items, 1):
@@ -3008,7 +3154,10 @@ def _run_liked_download_task(sec_uid: str, max_pages: int, target_dir: Path):
                     continue
 
                 _add_log(f"[{idx}/{len(all_items)}] 正在下载: {media_info['title'][:30]}...")
-                result = download_media(media_info, target_dir, custom_dir=liked_dir)
+                result = download_media(media_info, target_dir, custom_dir=liked_dir,
+                                        skip_existing=True, progress_key=liked_key)
+                if result.get("skipped"):
+                    skipped += 1
                 downloaded += 1
                 _set_task_state(downloaded_count=downloaded, current_title=result["title"])
             except Exception as e:
@@ -3021,7 +3170,7 @@ def _run_liked_download_task(sec_uid: str, max_pages: int, target_dir: Path):
                 delay = random.uniform(1.0, 3.0)
                 time.sleep(delay)
 
-        _add_log(f"🎉 批量下载点赞任务结束! 成功: {downloaded}，失败: {failed}")
+        _add_log(f"🎉 批量下载点赞任务结束! 成功: {downloaded - skipped}，跳过已下载: {skipped}，失败: {failed}")
         add_history_item(f"{nickname}的喜欢", "批量", liked_dir, downloaded)
         _set_task_state(status="completed")
 
@@ -3033,9 +3182,12 @@ def _run_liked_download_task(sec_uid: str, max_pages: int, target_dir: Path):
 def _run_batch_items_download_task(items: list, target_dir: Path, source_name: str = ""):
     """后台线程：下载指定的作品列表"""
     _add_log(f"正在准备批量下载选中的 {len(items)} 个作品...")
+    progress_key = f"batch:{source_name}" if source_name else ""
+    _log_resume_status("批量下载任务", items, progress_key)
     _reset_task_state(total=len(items))
 
     downloaded = 0
+    skipped = 0
     failed = 0
 
     for idx, item in enumerate(items, 1):
@@ -3057,7 +3209,10 @@ def _run_batch_items_download_task(items: list, target_dir: Path, source_name: s
 
             _add_log(f"[{idx}/{len(items)}] 正在下载: {media_info['title'][:30]}...")
             custom_dir = target_dir / source_name if source_name else None
-            result = download_media(media_info, target_dir, custom_dir=custom_dir)
+            result = download_media(media_info, target_dir, custom_dir=custom_dir,
+                                    skip_existing=True, progress_key=progress_key)
+            if result.get("skipped"):
+                skipped += 1
             downloaded += 1
             _set_task_state(downloaded_count=downloaded, current_title=result["title"])
         except Exception as e:
@@ -3070,7 +3225,7 @@ def _run_batch_items_download_task(items: list, target_dir: Path, source_name: s
             delay = random.uniform(1.0, 3.0)
             time.sleep(delay)
 
-    _add_log(f"🎉 批量下载任务结束! 成功: {downloaded}，失败: {failed}")
+    _add_log(f"🎉 批量下载任务结束! 成功: {downloaded - skipped}，跳过已下载: {skipped}，失败: {failed}")
     if source_name and len(items) > 1 and downloaded > 0:
         add_history_item(f"{source_name} (批量下载)", "批量", target_dir / source_name, 0)
     _set_task_state(status="completed")
