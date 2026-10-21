@@ -69,6 +69,8 @@ DEFAULT_SETTINGS = {
     "rss_cache_ttl": 300,
     "rss_token": "",
     "rss_base_url": "",
+    "rss_local_avatar": True,
+    "rss_avatar_from_article": True,
     "weread_platform_url": WEREAD_PLATFORM_URL,
 }
 

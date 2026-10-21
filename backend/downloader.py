@@ -22,6 +22,7 @@ from backend.config import (
     DEFAULT_HEADERS, get_proxies_dict, get_settings, report_proxy_status
 )
 from backend.wechat_url import normalize_wechat_short_url, short_id_from_review_id
+from backend.avatar_cache import extract_account_avatar
 
 logger = logging.getLogger(__name__)
 
@@ -1415,6 +1416,7 @@ def download_single_article(url: str, out_dir: Path, title_hint: str = "", _redi
         "time": datetime.now(timezone.utc).isoformat(timespec="seconds"),
         "publish_time": publish_time,
         "cover_url": cover_url,
+        "round_head_img": extract_account_avatar(raw_html),
         "digest": digest,
         "source": source,
         "author": author,

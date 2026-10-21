@@ -29,7 +29,9 @@ from urllib.parse import quote
 
 from flask import Response
 
+from backend.avatar_cache import article_avatar, cache_avatar
 from backend.config import (
+    ACCOUNTS_FILE,
     DATA_DIR,
     DOWNLOAD_HISTORY_FILE,
     get_settings,
@@ -54,14 +56,44 @@ _cache_lock = threading.Lock()
 
 
 def _file_mtimes() -> tuple:
-    """两个数据文件的修改时间，作为缓存失效依据。"""
+    """文章与公众号元数据三个文件的修改时间，作为缓存失效依据。"""
     out = []
-    for path in (DOWNLOAD_HISTORY_FILE, RSS_ARTICLES_FILE):
+    for path in (DOWNLOAD_HISTORY_FILE, RSS_ARTICLES_FILE, ACCOUNTS_FILE):
         try:
             out.append(path.stat().st_mtime_ns)
         except OSError:
             out.append(0)
     return tuple(out)
+
+
+def get_account_avatar(account: str, items: list | None = None,
+                       from_article: bool = True) -> str:
+    """优先使用账号头像，缺失时从本地元数据及最近文章补全。"""
+    accounts = load_json(ACCOUNTS_FILE, [])
+    for item in accounts if isinstance(accounts, list) else []:
+        if not isinstance(item, dict):
+            continue
+        if item.get("nickname") == account:
+            avatar = str(item.get("round_head_img") or "").strip()
+            if avatar.startswith(("https://", "http://")):
+                return avatar
+    if not from_article:
+        return ""
+    candidates = (items or [])[:3]
+    for item in candidates:
+        if not item.get("path"):
+            continue
+        metadata = load_json(Path(item["path"]) / "metadata.json", {})
+        if isinstance(metadata, dict):
+            avatar = str(metadata.get("round_head_img") or "").strip()
+            if avatar.startswith(("https://", "http://")):
+                return avatar
+    for item in candidates:
+        if item.get("link"):
+            avatar = article_avatar(item["link"])
+            if avatar:
+                return avatar
+    return ""
 
 
 def _load_all_articles() -> dict:
@@ -102,6 +134,10 @@ def _cfg(settings: dict, key: str, env: str, default):
 
 def _cfg_int(settings: dict, key: str, env: str, default: int) -> int:
     return int(_to_float(_cfg(settings, key, env, default), default))
+
+
+def _cfg_bool(settings: dict, key: str, env: str, default: bool) -> bool:
+    return str(_cfg(settings, key, env, default)).strip().lower() not in ("0", "false", "no", "off")
 
 
 def _item_key(link: str, account: str, title: str) -> str:
@@ -314,7 +350,7 @@ def _local_link(base_url: str, item: dict) -> str:
 
 
 def render_feed(items: list, title: str, description: str,
-                base_url: str, fulltext: bool = True) -> str:
+                base_url: str, fulltext: bool = True, image_url: str = "") -> str:
     xml_items = []
     for item in items:
         # 本地有落盘文件就走本地预览链接，否则回落到公众号原始链接
@@ -347,6 +383,16 @@ def render_feed(items: list, title: str, description: str,
         parts.append("    </item>")
         xml_items.append("\n".join(parts))
 
+    image_xml = ""
+    if image_url:
+        image_xml = (
+            "    <image>\n"
+            "      <url>%s</url>\n"
+            "      <title>%s</title>\n"
+            "      <link>%s</link>\n"
+            "    </image>\n"
+        ) % (_text(image_url), _text(title), _text(base_url))
+
     return (
         '<?xml version="1.0" encoding="utf-8"?>\n'
         '<rss version="2.0" xmlns:content="http://purl.org/rss/1.0/modules/content/" xmlns:dc="http://purl.org/dc/elements/1.1/">\n'
@@ -354,6 +400,7 @@ def render_feed(items: list, title: str, description: str,
         "    <title>%s</title>\n"
         "    <link>%s</link>\n"
         "    <description>%s</description>\n"
+        "%s"
         "    <language>zh-CN</language>\n"
         "    <generator>wechat-mp-tools</generator>\n"
         "    <lastBuildDate>%s</lastBuildDate>\n"
@@ -364,6 +411,7 @@ def render_feed(items: list, title: str, description: str,
         _text(title),
         _text(base_url),
         _text(description),
+        image_xml,
         formatdate(time.time(), usegmt=True),
         "\n".join(xml_items),
     )
@@ -405,7 +453,10 @@ def build_feed(account: str | None, limit: int, offset: int,
     """返回 (xml, etag)，结果按 (参数 + 文件 mtime) 缓存在进程内。"""
     settings = get_settings()
     ttl = _cfg_int(settings, "rss_cache_ttl", "RSS_CACHE_TTL", DEFAULT_TTL)
-    key = (account or "", limit, offset, bool(fulltext), base_url, _file_mtimes())
+    local_avatar = _cfg_bool(settings, "rss_local_avatar", "RSS_LOCAL_AVATAR", True)
+    from_article = _cfg_bool(settings, "rss_avatar_from_article", "RSS_AVATAR_FROM_ARTICLE", True)
+    key = (account or "", limit, offset, bool(fulltext), base_url,
+           local_avatar, from_article, _file_mtimes())
 
     with _cache_lock:
         hit = _cache.get(key)
@@ -417,13 +468,20 @@ def build_feed(account: str | None, limit: int, offset: int,
     window = items[offset:] if limit <= 0 else items[offset:offset + limit]
 
     if account:
-        title = "微信公众号 - %s RSS" % account
-        description = "%s 微信公众号文章订阅" % account
+        title = account
+        description = f"{account}的微信公众号文章"
+        image_url = get_account_avatar(account, items, from_article=from_article)
+        if image_url and local_avatar:
+            filename = cache_avatar(image_url)
+            if filename:
+                image_url = f"{base_url}api/articles/avatars/{filename}"
     else:
         title = "微信公众号 RSS"
         description = "微信公众号文章订阅"
+        image_url = ""
 
-    xml = render_feed(window, title, description, base_url, fulltext=fulltext)
+    xml = render_feed(window, title, description, base_url,
+                      fulltext=fulltext, image_url=image_url)
     etag = 'W/"%s"' % hashlib.sha1(xml.encode("utf-8")).hexdigest()[:20]
 
     with _cache_lock:
