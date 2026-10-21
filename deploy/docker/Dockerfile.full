@@ -1,0 +1,69 @@
+#
+# 全功能版镜像：公众号 + RSS + 抖音 / 快手 / 小红书 / B 站 / 转码。
+#
+# 与默认的公众号版（Dockerfile）区别：
+#   - 入口是 app.py（完整版），不是 app_mp.py
+#   - 装完整 requirements.txt（去掉桌面壳 pywebview）
+#   - 装 ffmpeg（B 站音视频混流、转码）
+#   - 体积约 1.6 GB，内存建议 2 GB
+#
+# 仍然不可用的：微信视频号抓包（依赖本机微信客户端）、打开文件夹/文件、客户端自动更新。
+#
+# 构建：
+#   docker build -f deploy/docker/Dockerfile.full -t wechat-mp-tools-full:latest .
+#
+# 或在 deploy/docker/.env 里改：
+#   DOCKERFILE=deploy/docker/Dockerfile.full
+#   IMAGE=wechat-mp-tools-full:latest
+#   MEMORY_LIMIT=2g
+
+FROM python:3.12-slim
+
+ARG INSTALL_BROWSERS=1
+
+ENV PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PIP_NO_CACHE_DIR=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    TZ=Asia/Shanghai \
+    PORT=5200 \
+    APP_ENTRY=app.py \
+    PLAYWRIGHT_BROWSERS_PATH=/app/ms-playwright
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        ca-certificates curl ffmpeg tzdata \
+    && ln -snf /usr/share/zoneinfo/$TZ /etc/localtime \
+    && echo "$TZ" > /etc/timezone \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+# pywebview 是桌面窗口依赖，服务端用不到；其余（含 mitmproxy、scrapling、curl_cffi）原样安装
+COPY requirements.txt /tmp/requirements.txt
+RUN grep -viE '^[[:space:]]*pywebview' /tmp/requirements.txt > /tmp/req.txt \
+    && pip install -r /tmp/req.txt \
+    && rm -f /tmp/requirements.txt /tmp/req.txt
+
+RUN if [ "$INSTALL_BROWSERS" = "1" ]; then \
+        python -m playwright install --with-deps chromium \
+        && chmod -R a+rX /app/ms-playwright \
+        && CHROME_BIN="$(ls -d /app/ms-playwright/chromium-*/chrome-linux*/chrome | head -n 1)" \
+        && ln -sf "$CHROME_BIN" /usr/local/bin/chromium \
+        && echo "chromium -> $CHROME_BIN" ; \
+    else \
+        echo "skip chromium: PDF 导出与需要浏览器渲染的功能将不可用" ; \
+    fi
+
+COPY app.py ./
+COPY backend ./backend
+COPY frontend ./frontend
+
+COPY deploy/docker/entrypoint.sh /usr/local/bin/entrypoint.sh
+RUN chmod +x /usr/local/bin/entrypoint.sh && mkdir -p /app/data
+
+EXPOSE 5200
+
+HEALTHCHECK --interval=30s --timeout=5s --start-period=60s --retries=3 \
+    CMD curl -fsS "http://127.0.0.1:${PORT}/healthz" >/dev/null || exit 1
+
+ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]

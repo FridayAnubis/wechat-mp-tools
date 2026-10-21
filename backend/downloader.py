@@ -400,6 +400,10 @@ def export_html_to_pdf(html_path: Path, pdf_path: Path, title: str = "") -> bool
         str(html_path)
     ]
 
+    # 容器内通常以 root 运行，Chrome 的沙箱在这种环境下起不来，会直接退出导致导出静默失败
+    if hasattr(os, "geteuid") and os.geteuid() == 0:
+        cmd.insert(1, "--no-sandbox")
+
     try:
         res = subprocess.run(cmd, capture_output=True, timeout=60)
         return pdf_path.exists() and pdf_path.stat().st_size > 0
@@ -1175,6 +1179,18 @@ def download_single_article(url: str, out_dir: Path, title_hint: str = "", _redi
 
     # 提取正文区域
     content_html = extract_article_content(raw_html)
+
+    # 内容过滤：屏蔽广告块、二维码、以及被当作小节标题的横幅图片。
+    # 只影响「清洗后」的产物（.html / content.txt / .md / PDF），
+    # _raw.html 与 data.json 仍保留原始正文，方便回头重跑。
+    try:
+        from backend.content_filter import filter_article_html
+
+        filtered_html = filter_article_html(content_html)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("内容过滤失败，使用原始正文: %s", exc)
+        filtered_html = content_html
+
     video_iframes = _extract_video_iframes(raw_html)
     video_urls = _extract_video_urls(raw_html)
 
@@ -1248,7 +1264,7 @@ def download_single_article(url: str, out_dir: Path, title_hint: str = "", _redi
                 )
 
     # 替换 URL
-    localized = content_html
+    localized = filtered_html
     for orig, local in url_map.items():
         if orig.startswith("__video_iframe__"):
             video, video_tag = local
@@ -1359,7 +1375,7 @@ def download_single_article(url: str, out_dir: Path, title_hint: str = "", _redi
     (art_dir / "data.json").write_text(json.dumps(new_json_data, ensure_ascii=False, indent=2), encoding="utf-8")
 
     # 保存纯文本内容（用于 AI 一键转写）
-    clean_text = clean_html_to_text(content_html)
+    clean_text = clean_html_to_text(filtered_html)
     (art_dir / "content.txt").write_text(clean_text, encoding="utf-8")
 
     # 1. 保存 Markdown (.md) 文件
@@ -1374,7 +1390,7 @@ def download_single_article(url: str, out_dir: Path, title_hint: str = "", _redi
                 "cover_url": cover_url,
                 "publish_time": publish_time,
             }
-            md_text = html_to_markdown(content_html, meta=md_meta, media_map=url_map)
+            md_text = html_to_markdown(filtered_html, meta=md_meta, media_map=url_map)
             md_file_path = art_dir / f"{safe_title}.md"
             md_file_path.write_text(md_text, encoding="utf-8")
         except Exception:

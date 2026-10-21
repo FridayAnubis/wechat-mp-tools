@@ -1,0 +1,53 @@
+# WeRSS 单机版（SQLite + 内置 Redis），适合 NAS / 小内存机器 / 先跑通再上生产
+#
+#   cp .env.example .env && vi .env
+#   docker compose -f docker-compose.lite.yaml up -d
+#
+# 与生产版的差异：
+#   - 无外部 MySQL / Redis，数据全部落在 ./data
+#   - 只用单线程，避免 SQLite 写锁竞争
+#   - 备份就是打包 ./data 目录
+
+name: we-mp-rss-lite
+
+services:
+  app:
+    image: ${WERSS_IMAGE:-ghcr.io/rachelos/we-mp-rss:latest}
+    container_name: we-mp-rss
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      TZ: ${TZ:-Asia/Shanghai}
+      DB: sqlite:////app/data/we_mp_rss.db
+      REDIS_SERVER_ENABLED: "True"
+      RSS_BASE_URL: ${RSS_BASE_URL:?请在 .env 中设置 RSS_BASE_URL}
+      RSS_LOCAL: ${RSS_LOCAL:-True}
+      PROXY_ENABLED: ${PROXY_ENABLED:-False}
+      ENABLE_JOB: ${ENABLE_JOB:-True}
+      THREADS: "1"
+    ports:
+      - "${WERSS_BIND:-0.0.0.0}:${WERSS_PORT:-8001}:8001"
+    volumes:
+      - ./data:/app/data
+      - ./config.yaml:/app/config.yaml
+      # 应用 rss-opt 优化补丁（免重建镜像，取消注释即可）
+      # - ../rss-opt/files/apis/rss.py:/app/apis/rss.py:ro
+      # - ../rss-opt/files/core/rss.py:/app/core/rss.py:ro
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - python3 -c "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8001/', timeout=5).status==200 else 1)"
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 120s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    deploy:
+      resources:
+        limits:
+          memory: ${APP_MEMORY_LIMIT:-2g}

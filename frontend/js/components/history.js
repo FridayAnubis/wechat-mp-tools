@@ -548,6 +548,8 @@ const HistoryPage = {
 
         const title = this.escapeHtml(item.title || '文章正文');
         const path = this.escapeHtml(item.path || '');
+        // 容器部署时后端会给出宿主机路径，只用于展示；按钮仍用真实路径
+        const displayPath = this.escapeHtml(item.display_path || item.path || '');
         const origUrl = item.link || '';
 
         if (!item.success) {
@@ -594,7 +596,7 @@ const HistoryPage = {
             <div class="history-right-header">
                 <div style="display: flex; flex-direction: column; gap: 2px; min-width: 0; flex: 1; padding-right: 15px;">
                     <div style="font-size: 0.95rem; font-weight: 600; color: var(--text-primary); overflow: hidden; text-overflow: ellipsis; white-space: nowrap;" title="${title}">${title}</div>
-                    <div style="font-size: 0.75rem; color: var(--text-muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap;">${path}</div>
+                    <div style="font-size: 0.75rem; color: var(--text-muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap;">${displayPath}</div>
                 </div>
                 <div style="display: flex; gap: 6px; flex-shrink: 0;">
                     ${origUrl ? `
@@ -932,8 +934,14 @@ const HistoryPage = {
             return;
         }
         try {
-            await API.articles.openFile(path, type);
-            Toast.success(type ? `正在打开 ${type.toUpperCase()}...` : '正在打开...');
+            const res = await API.articles.openFile(path, type);
+            // 容器部署下后端不调系统程序，而是返回一个可直接访问的链接
+            if (res && res.url) {
+                window.open(res.url, '_blank', 'noopener');
+                Toast.success('已在新标签页打开');
+            } else {
+                Toast.success(type ? `正在打开 ${type.toUpperCase()}...` : '正在打开...');
+            }
         } catch (err) {
             // shown by API
         }

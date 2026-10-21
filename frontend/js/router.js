@@ -79,6 +79,13 @@ const Router = {
         const pageKey = hash.split('?')[0]; // 去掉查询参数
         const page = this.routes[pageKey];
 
+        // 公众号精简模式：未打包的页面直接回退，避免渲染出调用 501 接口的空页面
+        if (window.MP_MODE && Array.isArray(window.MP_MODE.allowed) &&
+            window.MP_MODE.allowed.indexOf(pageKey) === -1) {
+            window.location.hash = '#' + window.MP_MODE.fallback;
+            return;
+        }
+
         if (!page) {
             window.location.hash = '#login';
             return;

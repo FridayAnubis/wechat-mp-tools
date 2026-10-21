@@ -1,0 +1,137 @@
+# WeRSS 生产部署编排（app + MySQL + Redis + 可选 singbox 出口）
+#
+# 用法：
+#   cp .env.example .env && vi .env        # 必填项见 .env.example
+#   docker compose up -d                   # 不启用代理
+#   docker compose --profile proxy up -d   # 启用 singbox 代理出口
+#
+# 约定：
+#   - 所有密码/地址只来自 .env，编排文件里不出现明文
+#   - 只有 /app/data 需要持久化
+#   - 数据库与 Redis 不对宿主机暴露端口，只走容器网络
+
+name: we-mp-rss
+
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "3"
+
+services:
+  app:
+    image: ${WERSS_IMAGE:-ghcr.io/rachelos/we-mp-rss:latest}
+    container_name: we-mp-rss
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      TZ: ${TZ:-Asia/Shanghai}
+      DB: mysql+pymysql://${MYSQL_USER}:${MYSQL_PASSWORD}@db:3306/${MYSQL_DATABASE}?charset=utf8mb4
+      REDIS_URL: redis://redis:6379/0
+      REDIS_SERVER_ENABLED: "False"
+      RSS_BASE_URL: ${RSS_BASE_URL:?请在 .env 中设置 RSS_BASE_URL，否则订阅里的链接会指向容器内网地址}
+      RSS_LOCAL: ${RSS_LOCAL:-True}
+      PROXY_ENABLED: ${PROXY_ENABLED:-False}
+      PROXY_HTTP_URL: ${PROXY_HTTP_URL:-http://singbox:7890}
+      ENABLE_JOB: ${ENABLE_JOB:-True}
+      THREADS: ${THREADS:-1}
+      TOKEN_EXPIRE_MINUTES: ${TOKEN_EXPIRE_MINUTES:-4320}
+    ports:
+      - "${WERSS_BIND:-0.0.0.0}:${WERSS_PORT:-8001}:8001"
+    volumes:
+      - ./data:/app/data
+      - ./config.yaml:/app/config.yaml
+      # 应用 rss-opt 优化补丁（免重建镜像，取消注释即可）
+      # - ../rss-opt/files/apis/rss.py:/app/apis/rss.py:ro
+      # - ../rss-opt/files/core/rss.py:/app/core/rss.py:ro
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - python3 -c "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8001/', timeout=5).status==200 else 1)"
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 120s
+    logging: *default-logging
+    deploy:
+      resources:
+        limits:
+          memory: ${APP_MEMORY_LIMIT:-2g}
+
+  db:
+    image: ${MYSQL_IMAGE:-mysql:8.3.0}
+    container_name: we-mp-rss-db
+    restart: unless-stopped
+    command:
+      - --character-set-server=utf8mb4
+      - --collation-server=utf8mb4_unicode_ci
+      - --max_connections=200
+      - --innodb_buffer_pool_size=256M
+    environment:
+      TZ: ${TZ:-Asia/Shanghai}
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:?请在 .env 中设置 MYSQL_ROOT_PASSWORD}
+      MYSQL_DATABASE: ${MYSQL_DATABASE:-we_mp_rss}
+      MYSQL_USER: ${MYSQL_USER:-rss_user}
+      MYSQL_PASSWORD: ${MYSQL_PASSWORD:?请在 .env 中设置 MYSQL_PASSWORD}
+    volumes:
+      - db_data:/var/lib/mysql
+    healthcheck:
+      test: ["CMD-SHELL", "mysqladmin ping -h 127.0.0.1 -u root -p$$MYSQL_ROOT_PASSWORD --silent"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 40s
+    logging: *default-logging
+    deploy:
+      resources:
+        limits:
+          memory: ${DB_MEMORY_LIMIT:-1g}
+
+  redis:
+    image: ${REDIS_IMAGE:-redis:7-alpine}
+    container_name: we-mp-rss-redis
+    restart: unless-stopped
+    command:
+      - redis-server
+      - --appendonly
+      - "yes"
+      - --maxmemory
+      - ${REDIS_MAXMEMORY:-256mb}
+      - --maxmemory-policy
+      - allkeys-lru
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+    logging: *default-logging
+
+  # 可选：微信对机房 IP 风控时启用，PROXY_URL 支持 socks5:// 与 http://
+  singbox:
+    profiles: ["proxy"]
+    image: ${SINGBOX_IMAGE:-ghcr.io/sagernet/sing-box:latest}
+    container_name: we-mp-rss-singbox
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      SINGBOX_INBOUND_PORT: "7890"
+      SINGBOX_LOG_LEVEL: ${SINGBOX_LOG_LEVEL:-warn}
+    entrypoint:
+      - /bin/sh
+      - /etc/sing-box/run-singbox.sh
+    volumes:
+      - ./singbox/run-singbox.sh:/etc/sing-box/run-singbox.sh:ro
+    logging: *default-logging
+
+volumes:
+  db_data:
+  redis_data:

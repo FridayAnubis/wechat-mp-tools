@@ -27,6 +27,12 @@ venv*/
 # Claude agent config
 .claude/
 .superpowers/
+.workbuddy-ai/
+
+# Local env files
+.env
+deploy/docker/.env
+deploy/docker/data/
 
 # Local architecture-analysis graph
 graphify-out/

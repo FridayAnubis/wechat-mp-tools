@@ -25,6 +25,7 @@ from backend.config import (
 )
 from backend.account_pool import borrow_session, borrow_weread_session, account_pool, get_weread_session
 from backend.accounts import biz_to_book_id
+from backend.runtime import desktop_available, host_path_hint
 
 articles_bp = Blueprint("articles", __name__, url_prefix="/api/articles")
 
@@ -698,6 +699,33 @@ def _sync_history_from_disk(history: list) -> bool:
     return changed
 
 
+def _resolve_history_path(raw_path: str, download_dir: str) -> str:
+    """把历史记录里的路径重定位到当前下载目录。
+
+    迁移场景：桌面版记的是 /Users/xxx/.../articles_full/公众号/文章，
+    容器里这份路径不存在。这里按 articles_full 之后的部分拼到当前
+    download_dir 下，只有目标确实存在才替换，避免误伤。
+    """
+    if not raw_path:
+        return raw_path
+    try:
+        if Path(raw_path).exists():
+            return raw_path
+    except OSError:
+        pass
+
+    parts = Path(raw_path).parts
+    if "articles_full" in parts:
+        idx = len(parts) - 1 - parts[::-1].index("articles_full")
+        candidate = Path(download_dir).joinpath(*parts[idx + 1:])
+        try:
+            if candidate.exists():
+                return str(candidate)
+        except OSError:
+            pass
+    return raw_path
+
+
 @articles_bp.route("/history", methods=["GET"])
 def get_history():
     """获取下载历史"""
@@ -706,6 +734,8 @@ def get_history():
     # 自动从磁盘同步丢失的历史记录
     if _sync_history_from_disk(history):
         save_json(DOWNLOAD_HISTORY_FILE, history)
+
+    download_dir = get_settings().get("download_dir") or str(OUTPUT_DIR)
 
     indexed_history = []
     for index, item in enumerate(history):
@@ -716,6 +746,10 @@ def get_history():
             if not indexed.get("account") and indexed.get("account_name"):
                 indexed["account"] = indexed["account_name"]
             indexed["_index"] = index
+            if indexed.get("path"):
+                # 旧机器的绝对路径重定位到当前下载目录；界面上再显示宿主机路径
+                indexed["path"] = _resolve_history_path(indexed["path"], download_dir)
+                indexed["display_path"] = host_path_hint(indexed["path"])
             indexed_history.append(indexed)
     indexed_history.sort(key=lambda x: x.get("time", 0), reverse=True)
     # 限制返回数量
@@ -885,7 +919,6 @@ def _do_batch_download(task_id: str, articles: list, account_name: str):
                         "title": title, "success": False, "error": error_msg
                     })
 
-            # 这里改为按照发布文章的公众号分组，而不是之前的署名作者
             real_account = result.get("source")
             if not real_account or real_account == "url_download":
                 real_account = account_name if account_name != "url_download" else "链接下载"
@@ -1131,6 +1164,17 @@ def open_folder():
     try:
         path.mkdir(parents=True, exist_ok=True)
         resolved_path = str(path.resolve())
+
+        # 容器部署没有桌面环境，调 xdg-open 只会抛 FileNotFoundError
+        if not desktop_available():
+            hint = host_path_hint(resolved_path)
+            return jsonify({
+                "error": f"容器部署没有桌面环境，请在宿主机打开：{hint}",
+                "mode": "headless",
+                "container_path": resolved_path,
+                "host_path": hint,
+            }), 501
+
         if sys.platform == "darwin":
             subprocess.run(["open", resolved_path])
         elif sys.platform == "win32":
@@ -1178,6 +1222,18 @@ def open_file():
                     return jsonify({"error": "未找到 Markdown 文件"}), 404
 
         resolved_path = str(resolved_target.resolve())
+
+        # 容器部署：把「用系统程序打开」换成「浏览器直接访问」，前端会打开返回的 url
+        if not desktop_available():
+            url = "/api/articles/serve-file?path=" + urllib.parse.quote(resolved_path, safe="")
+            return jsonify({
+                "message": "已在浏览器中打开",
+                "mode": "headless",
+                "url": url,
+                "container_path": resolved_path,
+                "host_path": host_path_hint(resolved_path),
+            })
+
         if sys.platform == "darwin":
             subprocess.run(["open", resolved_path])
         elif sys.platform == "win32":
@@ -1209,6 +1265,16 @@ def open_parent():
             return jsonify({"error": "文件或文件夹不存在"}), 404
             
         resolved_path = str(path.resolve())
+
+        if not desktop_available():
+            target_dir = path.parent.resolve() if path.is_file() else path.resolve()
+            hint = host_path_hint(str(target_dir))
+            return jsonify({
+                "error": f"容器部署没有桌面环境，请在宿主机打开：{hint}",
+                "mode": "headless",
+                "host_path": hint,
+            }), 501
+
         if path.is_file():
             if sys.platform == "darwin":
                 subprocess.run(["open", "-R", resolved_path])
@@ -1229,6 +1295,48 @@ def open_parent():
         return jsonify({"message": "已打开"})
     except Exception as e:
         return jsonify({"error": f"打开失败: {str(e)}"}), 500
+
+
+@articles_bp.route("/content-filter", methods=["GET"])
+def get_content_filter():
+    """获取内容过滤规则（屏蔽广告、二维码、小节标题横幅图等）"""
+    from backend.content_filter import DEFAULT_RULES, last_stats, load_rules
+
+    return jsonify({
+        "rules": load_rules(),
+        "defaults": DEFAULT_RULES,
+        "last_stats": last_stats(),
+    })
+
+
+@articles_bp.route("/content-filter", methods=["POST"])
+def save_content_filter():
+    """保存内容过滤规则，新下载的文章立即生效"""
+    from backend.content_filter import save_rules
+
+    data = request.get_json() or {}
+    rules = data.get("rules") if isinstance(data.get("rules"), dict) else data
+    return jsonify({"rules": save_rules(rules), "message": "规则已保存"})
+
+
+@articles_bp.route("/content-filter/apply-existing", methods=["POST"])
+def apply_content_filter_existing():
+    """对已下载文章重跑过滤。
+
+    默认 dry_run=true 只统计不改文件；确认后传 {"dry_run": false} 才真正改写，
+    改写前会把原 .html 备份成 .html.bak。
+    """
+    from backend.content_filter import refilter_existing
+
+    data = request.get_json() or {}
+    settings = get_settings()
+    download_dir = settings.get("download_dir") or str(OUTPUT_DIR)
+    result = refilter_existing(
+        download_dir,
+        dry_run=bool(data.get("dry_run", True)),
+        force=bool(data.get("force", False)),
+    )
+    return jsonify(result)
 
 
 @articles_bp.route("/serve-file", methods=["GET"])
@@ -1351,156 +1459,20 @@ def serve_file(filepath=""):
     return send_from_directory(target_path.parent, target_path.name)
 
 
+
+
 @articles_bp.route("/rss", methods=["GET"])
 @articles_bp.route("/rss/<account>", methods=["GET"])
 def get_rss(account=None):
+    """RSS 2.0 订阅输出。
+
+    具体实现见 backend/rss_feed.py：
+      - 每次请求只读一次 rss_articles.json 并建索引（原实现按账号重复全量解析）
+      - 按发布时间倒序，支持 ?limit= ?offset= 截断（默认 50，上限 500）
+      - ?full=0 只输出摘要，不读 content.txt
+      - 进程内缓存 + ETag/304，阅读器轮询基本不产生 IO
+      - 反向代理下按 X-Forwarded-* 或 rss_base_url 生成链接
     """
-    Generate an RSS 2.0 feed of successfully downloaded articles.
-    Merges manually downloaded articles with auto-fetched RSS subscription articles.
-    """
-    import email.utils
-    from urllib.parse import quote
-    import html
+    from backend.rss_feed import rss_response
 
-    history = load_json(DOWNLOAD_HISTORY_FILE, [])
-    # Filter successful downloads and exclude channels
-    items = [item for item in history if isinstance(item, dict) and item.get("success") and item.get("account") != "微信视频号"]
-
-    # Filter by account if specified
-    if account:
-        items = [item for item in items if item.get("account") == account]
-        feed_title = f"微信公众号 - {account} RSS"
-        feed_desc = f"{account} 微信公众号文章订阅"
-    else:
-        feed_title = "微信公众号 RSS"
-        feed_desc = "微信公众号文章订阅"
-
-    # Merge auto-fetched RSS articles
-    try:
-        from backend.rss_scheduler import rss_scheduler
-        # 同上，改为公众号分组
-        if account:
-            rss_arts = [(account, art) for art in rss_scheduler.get_articles(account)]
-        else:
-            # Get articles from all subscriptions
-            rss_arts = []
-            for sub in rss_scheduler.get_subscriptions():
-                nickname = sub.get("nickname", "")
-                rss_arts.extend((nickname, art) for art in rss_scheduler.get_articles(nickname))
-
-        # Convert auto-fetched articles to the same format, dedup by link
-        existing_links = {item.get("link") for item in items if item.get("link")}
-        for nickname, art in rss_arts:
-            link = art.get("link", "")
-            if link and link not in existing_links:
-                items.append({
-                    "title": art.get("title", ""),
-                    "link": link,
-                    "account": nickname,
-                    "author": art.get("author", ""),
-                    "success": True,
-                    "time": art.get("update_time", 0),
-                    "publish_time": art.get("update_time", 0),
-                    "cover_url": art.get("cover", ""),
-                    "digest": art.get("digest", ""),
-                    "path": art.get("path", ""),
-                })
-                existing_links.add(link)
-    except Exception:
-        pass  # If scheduler not available, just use download history
-        
-    # Get server host/port dynamically to construct local URLs
-    host_url = request.host_url
-    
-    xml_items = []
-    for item in items:
-        # Defensively convert all values to strings to prevent AttributeError on html.escape(None)
-        title_val = item.get("title") or ""
-        title = html.escape(str(title_val))
-        
-        acc_name_val = item.get("account") or "unknown"
-        acc_name = str(acc_name_val)
-        
-        safe_title = item.get("title") or ""
-        
-        # Check if local HTML file exists
-        local_exists = False
-        path_str = item.get("path")
-        if path_str:
-            try:
-                local_path = Path(path_str)
-                if local_path.exists():
-                    local_exists = True
-            except Exception:
-                pass
-
-        orig_url_val = item.get("link") or ""
-        orig_url = html.escape(str(orig_url_val))
-
-        if local_exists:
-            p_obj = Path(path_str)
-            local_url = f"{host_url}api/articles/serve-file/{quote(p_obj.parent.name)}/{quote(p_obj.name)}/{quote(p_obj.name)}.html"
-            xml_link = html.escape(local_url)
-        else:
-            xml_link = orig_url
-        
-        pub_time_val = item.get("publish_time") or item.get("time") or time.time()
-        try:
-            pub_time = float(pub_time_val)
-        except Exception:
-            pub_time = time.time()
-        pub_date = email.utils.formatdate(pub_time, usegmt=True)
-        
-        digest_val = item.get("digest") or ""
-        digest = html.escape(str(digest_val))
-        
-        cover_url_val = item.get("cover_url") or ""
-        cover_url = html.escape(str(cover_url_val))
-        
-        # Read content.txt if available for full text
-        content_encoded = ""
-        if path_str:
-            try:
-                txt_path = Path(path_str) / "content.txt"
-                if txt_path.exists():
-                    clean_text = txt_path.read_text(encoding="utf-8")
-                    clean_text = clean_text.replace("]]>", "]]&gt;")
-                    content_encoded = f"<content:encoded><![CDATA[{clean_text}]]></content:encoded>"
-            except Exception:
-                pass
-                
-        enclosure = f'<enclosure url="{cover_url}" type="image/jpeg" length="0"/>' if cover_url else ""
-        
-        # 文章署名单独输出为 dc:creator，不参与订阅分组
-        author_val = item.get("author") or ""
-        if not author_val and path_str:
-            meta = load_json(Path(path_str) / "metadata.json", {})
-            author_val = meta.get("author", "") if isinstance(meta, dict) else ""
-        creator = f"<dc:creator>{html.escape(str(author_val))}</dc:creator>" if author_val else ""
-
-        xml_items.append(f"""    <item>
-      <title>{title}</title>
-      <link>{xml_link}</link>
-      <guid isPermaLink="false">{orig_url or xml_link}</guid>
-      <pubDate>{pub_date}</pubDate>
-      <description>{digest}</description>
-      {creator}
-      {enclosure}
-      {content_encoded}
-    </item>""")
-    
-    items_str = "\n".join(xml_items)
-    
-    rss_xml = f"""<?xml version="1.0" encoding="utf-8"?>
-<rss version="2.0" xmlns:content="http://purl.org/rss/1.0/modules/content/" xmlns:dc="http://purl.org/dc/elements/1.1/">
-  <channel>
-    <title>{html.escape(feed_title)}</title>
-    <link>{host_url}</link>
-    <description>{html.escape(feed_desc)}</description>
-    <language>zh-CN</language>
-    <lastBuildDate>{email.utils.formatdate(time.time(), usegmt=True)}</lastBuildDate>
-{items_str}
-  </channel>
-</rss>"""
-
-    return Response(rss_xml, mimetype="application/xml")
+    return rss_response(request, account)

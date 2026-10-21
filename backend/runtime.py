@@ -3,6 +3,7 @@ Runtime helpers for source and PyInstaller builds.
 """
 
 import os
+import shutil
 import sys
 import traceback
 from pathlib import Path
@@ -42,6 +43,46 @@ def app_dir() -> Path:
 
 def log_file() -> Path:
     return app_dir() / "wechat_mp_tools.log"
+
+
+def desktop_available() -> bool:
+    """当前环境是否有可用的桌面文件管理器。
+
+    容器里没有 xdg-open，调用会抛 FileNotFoundError；这里提前判断，
+    让「打开文件夹」能给出可读提示，而不是 errno 报错。
+    可用环境变量 WECHAT_MP_DESKTOP=0/1 强制覆盖。
+    """
+    override = os.environ.get("WECHAT_MP_DESKTOP")
+    if override is not None and override.strip() != "":
+        return override.strip().lower() not in ("0", "false", "no", "off")
+
+    if sys.platform in ("darwin", "win32"):
+        return True
+
+    # Linux / 容器
+    if os.path.exists("/.dockerenv"):
+        return False
+    if not (os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY")):
+        return False
+    return shutil.which("xdg-open") is not None
+
+
+def host_path_hint(path) -> str:
+    """把容器内路径映射成宿主机上能直接找到的路径，用于提示文案。
+
+    容器里 /app/data 对应宿主机 ./data，通过 HOST_DATA_DIR 告诉服务端。
+    桌面模式下没有该环境变量，原样返回。
+    """
+    try:
+        container_data = str((app_dir() / "data").resolve())
+    except OSError:
+        return str(path)
+
+    target = str(path)
+    host_data = os.environ.get("HOST_DATA_DIR", "").strip()
+    if host_data and target.startswith(container_data):
+        return host_data.rstrip("/") + target[len(container_data):]
+    return target
 
 
 def configure_runtime():

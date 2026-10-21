@@ -38,6 +38,55 @@ const DownloadPage = {
                 </div>
             </div>
 
+            <!-- 内容过滤 -->
+            <div class="card" style="margin-bottom: var(--spacing-lg);">
+                <div class="card-header" style="display: flex; align-items: center; justify-content: space-between;">
+                    <h3 class="card-title">🧹 内容过滤</h3>
+                    <span class="badge" id="cf-badge">加载中</span>
+                </div>
+
+                <div class="switch-group">
+                    <div class="switch-label">
+                        <span class="label-title">下载时自动过滤</span>
+                        <span class="label-desc">去掉广告块、二维码，以及被当作小节标题的横幅图片</span>
+                    </div>
+                    <label class="switch">
+                        <input type="checkbox" id="cf-enabled">
+                        <span class="switch-slider"></span>
+                    </label>
+                </div>
+
+                <div class="grid grid-2" style="gap: 12px;">
+                    <div class="form-group">
+                        <label class="form-label" for="cf-ratio">横幅图宽高比阈值</label>
+                        <input type="number" class="form-input" id="cf-ratio" step="0.01" min="0.05" max="0.9">
+                        <div class="form-hint">微信图片 data-ratio = 高/宽；小节标题图通常 0.1~0.2，正文配图 ≥0.5</div>
+                    </div>
+                    <div class="form-group">
+                        <label class="form-label" for="cf-min-width">最小宽度 (px)</label>
+                        <input type="number" class="form-input" id="cf-min-width" step="50" min="0">
+                        <div class="form-hint">宽度达到该值的图才会被判为横幅</div>
+                    </div>
+                </div>
+
+                <div class="form-group">
+                    <label class="form-label" for="cf-img-kw">图片关键词</label>
+                    <input type="text" class="form-input" id="cf-img-kw" placeholder="分割线、二维码、扫码">
+                    <div class="form-hint">图片的 alt / title / 文件名命中任一词即删除，逗号分隔</div>
+                </div>
+
+                <div class="form-group">
+                    <label class="form-label" for="cf-text-kw">文本关键词</label>
+                    <input type="text" class="form-input" id="cf-text-kw" placeholder="点击上方蓝字、扫码关注">
+                    <div class="form-hint">200 字以内的短段落命中任一词即删除，逗号分隔</div>
+                </div>
+
+                <div class="btn-group">
+                    <button class="btn btn-primary" onclick="DownloadPage.saveContentFilter()">保存过滤设置</button>
+                    <button class="btn btn-secondary" onclick="DownloadPage.applyFilterToExisting()">应用到已下载文章</button>
+                </div>
+            </div>
+
             <!-- 下载进度 -->
             <div id="url-download-progress" style="display: none;">
                 <div class="download-progress-card">
@@ -76,6 +125,104 @@ const DownloadPage = {
         if (this._pollTimer) {
             clearInterval(this._pollTimer);
             this._pollTimer = null;
+        }
+    },
+
+    // ── 内容过滤设置 ────────────────────────────────────────
+
+    async init() {
+        await this.loadContentFilter();
+    },
+
+    _cfValue(id) {
+        const el = document.getElementById(id);
+        return el ? el.value : '';
+    },
+
+    _cfSplitKeywords(raw) {
+        return String(raw || '')
+            .split(/[,，、\n]/)
+            .map(function (s) { return s.trim(); })
+            .filter(Boolean);
+    },
+
+    _setFilterBadge(enabled) {
+        const el = document.getElementById('cf-badge');
+        if (!el) return;
+        el.textContent = enabled ? '已开启' : '已关闭';
+        el.className = enabled ? 'badge badge-success' : 'badge';
+    },
+
+    async loadContentFilter() {
+        try {
+            const res = await API.get('/api/articles/content-filter', { showError: false });
+            const r = (res && res.rules) || {};
+            const banner = r.banner_images || {};
+
+            const en = document.getElementById('cf-enabled');
+            if (en) en.checked = r.enabled !== false;
+            const ratio = document.getElementById('cf-ratio');
+            if (ratio) ratio.value = (banner.max_ratio !== undefined) ? banner.max_ratio : 0.22;
+            const mw = document.getElementById('cf-min-width');
+            if (mw) mw.value = (banner.min_width !== undefined) ? banner.min_width : 500;
+            const ik = document.getElementById('cf-img-kw');
+            if (ik) ik.value = (r.remove_image_keywords || []).join('、');
+            const tk = document.getElementById('cf-text-kw');
+            if (tk) tk.value = (r.remove_text_keywords || []).join('、');
+
+            this._setFilterBadge(r.enabled !== false);
+        } catch (err) {
+            this._setFilterBadge(false);
+        }
+    },
+
+    async saveContentFilter() {
+        const enabled = !!document.getElementById('cf-enabled').checked;
+        let ratio = parseFloat(this._cfValue('cf-ratio'));
+        let minWidth = parseInt(this._cfValue('cf-min-width'), 10);
+        if (isNaN(ratio)) ratio = 0.22;
+        if (isNaN(minWidth)) minWidth = 500;
+        ratio = Math.min(Math.max(ratio, 0.05), 0.9);
+        minWidth = Math.max(minWidth, 0);
+
+        const rules = {
+            enabled: enabled,
+            banner_images: { enabled: enabled, max_ratio: ratio, min_width: minWidth },
+            remove_image_keywords: this._cfSplitKeywords(this._cfValue('cf-img-kw')),
+            remove_text_keywords: this._cfSplitKeywords(this._cfValue('cf-text-kw')),
+        };
+
+        try {
+            await API.post('/api/articles/content-filter', { rules: rules });
+            this._setFilterBadge(enabled);
+            Toast.success('过滤设置已保存，之后下载的文章生效');
+        } catch (err) {
+            // 错误提示由 API 层统一弹出
+        }
+    },
+
+    async applyFilterToExisting() {
+        try {
+            const preview = await API.post('/api/articles/content-filter/apply-existing', {});
+            if (!preview.changed) {
+                Toast.info('已扫描 ' + preview.scanned + ' 篇，没有需要改写的文章');
+                return;
+            }
+            Modal.confirm(
+                '应用到已下载文章',
+                '将扫描 ' + preview.scanned + ' 篇，改写 ' + preview.changed +
+                ' 篇（原文会备份为 .html.bak，正文会重算）。确定继续？',
+                async () => {
+                    try {
+                        const r = await API.post('/api/articles/content-filter/apply-existing', { dry_run: false });
+                        Toast.success('已改写 ' + r.changed + ' 篇');
+                    } catch (err) {
+                        // 错误提示由 API 层统一弹出
+                    }
+                }
+            );
+        } catch (err) {
+            // 错误提示由 API 层统一弹出
         }
     },
 
