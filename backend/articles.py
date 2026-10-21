@@ -1347,6 +1347,42 @@ def serve_file(filepath=""):
     return send_from_directory(target_path.parent, target_path.name)
 
 
+def _find_article_html(art_dir: Path) -> Path | None:
+    """定位文章目录中实际保存的离线 HTML"""
+    if not art_dir.is_dir():
+        return None
+    candidates = sorted(f for f in art_dir.glob("*.html") if not f.name.endswith("_raw.html"))
+    for c in candidates:
+        if c.stem == art_dir.name:
+            return c
+    return candidates[0] if candidates else None
+
+
+_RSS_STRIP_BLOCKS = re.compile(r"<(script|style|iframe|noscript)\b[^>]*>.*?</\1\s*>", re.IGNORECASE | re.DOTALL)
+_RSS_EVENT_ATTRS = re.compile(r"""\s+on[a-z]+\s*=\s*(?:"[^"]*"|'[^']*'|[^\s>]+)""", re.IGNORECASE)
+_RSS_RELATIVE_URL = re.compile(r"""(\s(?:src|href|poster)\s*=\s*)(["'])(?!(?:[a-z][a-z0-9+.-]*:|//|#))([^"']+)\2""", re.IGNORECASE)
+_RSS_RELATIVE_CSS_URL = re.compile(r"""(url\(\s*(?:&quot;|["'])?)(media/[^)"'&]+)""", re.IGNORECASE)
+
+
+def _rss_article_body(html_text: str, base_url: str) -> str:
+    """提取离线 HTML 的 #js_content 正文，之前的会丢失富文本"""
+    start = re.search(r'<div id="js_content"[^>]*>', html_text)
+    if start:
+        end = html_text.rfind("</div>")
+        body = html_text[start.end():end if end > start.end() else None]
+    else:
+        m = re.search(r"<body[^>]*>(.*)</body>", html_text, re.IGNORECASE | re.DOTALL)
+        body = m.group(1) if m else html_text
+    body = _RSS_STRIP_BLOCKS.sub("", body)
+    body = _RSS_EVENT_ATTRS.sub("", body)
+    body = _RSS_RELATIVE_URL.sub(
+        lambda m: f"{m.group(1)}{m.group(2)}{base_url}{urllib.parse.quote(m.group(3), safe='/%?=&;')}{m.group(2)}",
+        body,
+    )
+    body = _RSS_RELATIVE_CSS_URL.sub(lambda m: f"{m.group(1)}{base_url}{urllib.parse.quote(m.group(2))}", body)
+    return body.strip()
+
+
 @articles_bp.route("/rss", methods=["GET"])
 @articles_bp.route("/rss/<account>", methods=["GET"])
 def get_rss(account=None):
@@ -1416,24 +1452,23 @@ def get_rss(account=None):
         
         safe_title = item.get("title") or ""
         
-        # Check if local HTML file exists
-        local_exists = False
+        # Locate the actually saved local HTML file
         path_str = item.get("path")
+        html_file = None
         if path_str:
             try:
-                local_path = Path(path_str)
-                if local_path.exists():
-                    local_exists = True
+                html_file = _find_article_html(Path(path_str))
             except Exception:
                 pass
 
         orig_url_val = item.get("link") or ""
         orig_url = html.escape(str(orig_url_val))
 
-        if local_exists:
-            p_obj = Path(path_str)
-            local_url = f"{host_url}api/articles/serve-file/{quote(p_obj.parent.name)}/{quote(p_obj.name)}/{quote(p_obj.name)}.html"
-            xml_link = html.escape(local_url)
+        art_base_url = ""
+        if html_file:
+            p_obj = html_file.parent
+            art_base_url = f"{host_url}api/articles/serve-file/{quote(p_obj.parent.name)}/{quote(p_obj.name)}/"
+            xml_link = html.escape(f"{art_base_url}{quote(html_file.name)}")
         else:
             xml_link = orig_url
         
@@ -1450,17 +1485,22 @@ def get_rss(account=None):
         cover_url_val = item.get("cover_url") or ""
         cover_url = html.escape(str(cover_url_val))
         
-        # Read content.txt if available for full text
-        content_encoded = ""
-        if path_str:
-            try:
+        # 之前默认用content.txt会丢富文本格式，现在优先使用html离线正文会好一些
+        content_body = ""
+        try:
+            if html_file:
+                content_body = _rss_article_body(html_file.read_text(encoding="utf-8"), art_base_url)
+            if not content_body and path_str:
                 txt_path = Path(path_str) / "content.txt"
                 if txt_path.exists():
-                    clean_text = txt_path.read_text(encoding="utf-8")
-                    clean_text = clean_text.replace("]]>", "]]&gt;")
-                    content_encoded = f"<content:encoded><![CDATA[{clean_text}]]></content:encoded>"
-            except Exception:
-                pass
+                    lines = txt_path.read_text(encoding="utf-8").splitlines()
+                    content_body = "\n".join(f"<p>{html.escape(ln)}</p>" for ln in lines if ln.strip())
+        except Exception:
+            pass
+        content_encoded = ""
+        if content_body:
+            content_body = content_body.replace("]]>", "]]&gt;")
+            content_encoded = f"<content:encoded><![CDATA[{content_body}]]></content:encoded>"
                 
         enclosure = f'<enclosure url="{cover_url}" type="image/jpeg" length="0"/>' if cover_url else ""
         
