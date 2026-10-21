@@ -1,0 +1,17 @@
+services:
+  wechat-mp-tools:
+    image: wechat-mp-tools:docker
+    build:
+      context: .
+    platform: linux/amd64
+    restart: unless-stopped
+    user: "${PUID:-1000}:${PGID:-1000}"
+    ports:
+      - "${WEB_PORT:-5200}:5200"
+    environment:
+      TZ: "${TZ:-Asia/Shanghai}"
+      WECHAT_MP_PUBLIC_URL: "${WECHAT_MP_PUBLIC_URL:-}"
+    volumes:
+      - "${DATA_DIR:-./data}:/app/data"
+    shm_size: 256mb
+    stop_grace_period: 60s

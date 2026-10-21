@@ -130,6 +130,14 @@ def serve_static(path):
 
 # ── 应用设置 API ──────────────────────────────────────────
 
+@app.route("/api/health", methods=["GET"])
+def health():
+    """Local readiness check: the web process and its RSS scheduler are alive."""
+    running = rss_scheduler._thread is not None and rss_scheduler._thread.is_alive()
+    status = {"status": "ok" if running else "unhealthy", "rss_scheduler": running}
+    return status, 200 if running else 503
+
+
 @app.route("/api/settings", methods=["GET"])
 def get_settings():
     from backend.config import get_settings as _get

@@ -1403,7 +1403,10 @@ def get_rss(account=None):
         pass  # If scheduler not available, just use download history
         
     # Get server host/port dynamically to construct local URLs
-    host_url = request.host_url
+    # Explicit public origin works behind a NAS reverse proxy without trusting
+    # arbitrary forwarded headers from clients on the LAN.
+    public_url = os.environ.get("WECHAT_MP_PUBLIC_URL", "").rstrip("/")
+    host_url = f"{public_url}/" if public_url else request.host_url
     
     xml_items = []
     for item in items:
@@ -1480,7 +1483,7 @@ def get_rss(account=None):
 <rss version="2.0" xmlns:content="http://purl.org/rss/1.0/modules/content/">
   <channel>
     <title>{html.escape(feed_title)}</title>
-    <link>{host_url}</link>
+    <link>{html.escape(host_url)}</link>
     <description>{html.escape(feed_desc)}</description>
     <language>zh-CN</language>
     <lastBuildDate>{email.utils.formatdate(time.time(), usegmt=True)}</lastBuildDate>

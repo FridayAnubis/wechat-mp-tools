@@ -382,6 +382,28 @@ def find_chromium_executable() -> str | None:
 
 def export_html_to_pdf(html_path: Path, pdf_path: Path, title: str = "") -> bool:
     """使用 Headless Chrome 将 HTML 文件转换为 PDF"""
+    from backend.runtime import is_headless_server, launch_chromium
+
+    if is_headless_server():
+        # Playwright owns and cleans up the temporary browser profile. This also
+        # avoids desktop Chromium CLI/profile assumptions on a headless NAS.
+        from playwright.sync_api import sync_playwright
+        pdf_path.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            with sync_playwright() as p:
+                browser = launch_chromium(p.chromium, headless=True)
+                try:
+                    page = browser.new_page()
+                    page.goto(html_path.resolve().as_uri(), wait_until="load", timeout=45000)
+                    page.pdf(path=str(pdf_path.resolve()), print_background=True,
+                             prefer_css_page_size=True)
+                finally:
+                    browser.close()
+            return pdf_path.exists() and pdf_path.stat().st_size > 0
+        except Exception as exc:
+            logger.warning("服务器 PDF 导出失败: %s", exc)
+            return False
+
     chrome_exe = find_chromium_executable()
     if not chrome_exe:
         return False

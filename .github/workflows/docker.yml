@@ -1,0 +1,118 @@
+name: Build and publish Linux amd64 Docker image
+
+on:
+  push:
+    branches: [main, 'fea(docker)']
+    tags: ['v*.*.*']
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      export_archive:
+        description: Also upload an offline image archive to Actions artifacts
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: docker-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  docker:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    defaults:
+      run:
+        shell: bash
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Set lowercase GHCR image name
+        id: image
+        run: echo "name=ghcr.io/${GITHUB_REPOSITORY,,}" >> "$GITHUB_OUTPUT"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Extract image tags and labels
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ steps.image.outputs.name }}
+          flavor: latest=false
+          tags: |
+            type=raw,value=latest,enable=${{ github.ref == 'refs/heads/main' }}
+            type=raw,value=docker,enable=${{ github.ref == 'refs/heads/fea(docker)' }}
+            type=ref,event=branch
+            type=ref,event=pr
+            type=semver,pattern={{version}}
+            type=sha,format=long
+          labels: |
+            org.opencontainers.image.title=WeChat MP Tools
+            org.opencontainers.image.description=Web UI, WeChat article downloads and RSS for Linux amd64 / TrueNAS
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.licenses=MIT
+
+      - name: Build and load Linux x86-64 image
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64
+          load: true
+          push: false
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha,scope=linux-amd64
+          cache-to: type=gha,mode=max,scope=linux-amd64
+
+      - name: Test Web, download, PDF, RSS and volume persistence
+        env:
+          IMAGE_ID: ${{ steps.build.outputs.imageid }}
+        run: bash scripts/test_docker.sh "$IMAGE_ID"
+
+      - name: Log in to GitHub Container Registry
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # Push the exact image tested above, without a second build.
+      - name: Publish tested image to GHCR
+        if: github.event_name != 'pull_request'
+        env:
+          IMAGE_TAGS: ${{ steps.meta.outputs.tags }}
+        run: |
+          while IFS= read -r tag; do
+            docker push "$tag"
+          done <<< "$IMAGE_TAGS"
+
+      - name: Export image for TrueNAS
+        if: github.event_name == 'workflow_dispatch' && inputs.export_archive
+        env:
+          IMAGE_ID: ${{ steps.build.outputs.imageid }}
+        run: |
+          docker tag "$IMAGE_ID" wechat-mp-tools:docker
+          docker save wechat-mp-tools:docker | gzip > wechat-mp-tools-linux-amd64.tar.gz
+          sha256sum wechat-mp-tools-linux-amd64.tar.gz > wechat-mp-tools-linux-amd64.tar.gz.sha256
+
+      - uses: actions/upload-artifact@v4
+        if: github.event_name == 'workflow_dispatch' && inputs.export_archive
+        with:
+          name: wechat-mp-tools-linux-amd64
+          path: |
+            wechat-mp-tools-linux-amd64.tar.gz
+            wechat-mp-tools-linux-amd64.tar.gz.sha256
+          compression-level: 0
+          if-no-files-found: error
+          retention-days: 7

@@ -95,6 +95,20 @@ python app.py    # 浏览器模式（访问 http://localhost:5200）
 
 ---
 
+## Linux x86-64 / TrueNAS Docker
+
+支持在 Linux x86-64 的 Docker / TrueNAS SCALE 上通过浏览器使用，重点支持公众号抓取、文章导出与 RSS 后台订阅。镜像内置 Chromium、中文字体和 FFmpeg，账号及文章通过数据卷持久化。
+
+```bash
+docker build --platform linux/amd64 -t wechat-mp-tools:docker .
+mkdir -p data # 确保容器 UID/GID（默认 1000:1000）具有写权限
+docker compose up -d
+```
+
+访问 `http://NAS的IP:5200`。TrueNAS 自定义 YAML、Dataset 权限、RSS 地址及升级方法见 [Docker 部署说明](docs/DOCKER.md)。
+
+已提供 GitHub Actions 自动构建与 GHCR 发布：`main` 发布 `latest`，`fea(docker)` 发布 `docker`，PR 仅测试；手动运行还可下载离线镜像包。详见 [Actions 发布说明](docs/DOCKER.md#github-actions-构建与发布)。
+
 ## 数据目录说明
 
 - **macOS**：`~/Library/Application Support/WeChat MP Tools/data/`

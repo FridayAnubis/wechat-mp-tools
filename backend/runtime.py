@@ -122,10 +122,31 @@ def _system_browser_channels() -> list[str]:
     return ["chrome", "msedge"]
 
 
+def is_headless_server() -> bool:
+    """Opt-in server mode; desktop launches keep their existing behavior."""
+    return os.environ.get("WECHAT_MP_HEADLESS", "").lower() in ("1", "true", "yes")
+
+
+def _server_launch_options(launch_kwargs):
+    kwargs = launch_kwargs.copy()
+    executable = os.environ.get("CHROME_PATH") or os.environ.get("CHROMIUM_PATH")
+    if executable and "channel" not in kwargs:
+        kwargs.setdefault("executable_path", executable)
+    if is_headless_server():
+        kwargs["headless"] = True
+        # Containers provide process isolation; Chromium's namespace sandbox is
+        # unavailable on many NAS hosts. Never require privileged Docker mode.
+        kwargs["args"] = list(dict.fromkeys([
+            *kwargs.get("args", []), "--no-sandbox", "--disable-dev-shm-usage",
+        ]))
+    return kwargs
+
+
 def launch_chromium(chromium, **launch_kwargs):
     """Launch bundled Chromium when present, otherwise fall back to system browsers."""
+    launch_kwargs = _server_launch_options(launch_kwargs)
     attempts = []
-    if "channel" in launch_kwargs:
+    if "channel" in launch_kwargs or "executable_path" in launch_kwargs:
         attempts.append({})
     elif bundled_browsers_available():
         if launch_kwargs.get("headless"):
@@ -160,8 +181,9 @@ def launch_chromium(chromium, **launch_kwargs):
 
 def launch_persistent_context(chromium, user_data_dir, **launch_kwargs):
     """Launch persistent browser context when present, otherwise fall back to system browsers."""
+    launch_kwargs = _server_launch_options(launch_kwargs)
     attempts = []
-    if "channel" in launch_kwargs:
+    if "channel" in launch_kwargs or "executable_path" in launch_kwargs:
         attempts.append({})
     elif bundled_browsers_available():
         if launch_kwargs.get("headless"):
