@@ -124,14 +124,31 @@ def _normalize_item(raw: dict, account: str) -> dict | None:
         or raw.get("time")
         or 0
     )
+    # 公众号分组应优先使用准确的公众号名称（account 或 source），避免使用文章作者署名
+    acc_name = account or str(raw.get("account") or raw.get("source") or "")
+    if not acc_name:
+        acc_name = str(raw.get("author") or "")
+
+    # 文章署名作者单独保存（与公众号名称区分开）
+    author = str(raw.get("author") or "")
+    path = str(raw.get("path") or "")
+    if not author and path:
+        try:
+            meta = load_json(Path(path) / "metadata.json", {})
+            if isinstance(meta, dict):
+                author = str(meta.get("author") or "")
+        except Exception:
+            pass
+
     return {
         "title": str(title),
         "link": str(link),
-        "account": str(raw.get("account") or raw.get("author") or account or ""),
+        "account": acc_name,
+        "author": author,
         "published": _to_float(published),
         "digest": str(raw.get("digest") or ""),
         "cover": str(raw.get("cover_url") or raw.get("cover") or ""),
-        "path": str(raw.get("path") or ""),
+        "path": path,
     }
 
 
@@ -155,7 +172,7 @@ def collect_items(account: str | None = None) -> list:
         if key in merged:
             # 同一篇：补全缺失字段，保留更早拿到的那条
             exist = merged[key]
-            for field in ("digest", "cover", "path"):
+            for field in ("digest", "cover", "path", "author"):
                 if not exist.get(field) and item.get(field):
                     exist[field] = item[field]
             if not exist.get("published") and item.get("published"):
@@ -312,6 +329,8 @@ def render_feed(items: list, title: str, description: str,
             "      <pubDate>%s</pubDate>" % formatdate(pub_ts, usegmt=True),
             "      <description>%s</description>" % _text(item["digest"]),
         ]
+        if item.get("author"):
+            parts.append("      <dc:creator>%s</dc:creator>" % _text(item["author"]))
         if item["cover"]:
             parts.append(
                 '      <enclosure url="%s" type="image/jpeg" length="0"/>'
@@ -328,7 +347,7 @@ def render_feed(items: list, title: str, description: str,
 
     return (
         '<?xml version="1.0" encoding="utf-8"?>\n'
-        '<rss version="2.0" xmlns:content="http://purl.org/rss/1.0/modules/content/">\n'
+        '<rss version="2.0" xmlns:content="http://purl.org/rss/1.0/modules/content/" xmlns:dc="http://purl.org/dc/elements/1.1/">\n'
         "  <channel>\n"
         "    <title>%s</title>\n"
         "    <link>%s</link>\n"

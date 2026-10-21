@@ -919,12 +919,15 @@ def _do_batch_download(task_id: str, articles: list, account_name: str):
                         "title": title, "success": False, "error": error_msg
                     })
 
-            real_account = result.get("author") or (account_name if account_name != "url_download" else "链接下载")
+            real_account = result.get("source")
+            if not real_account or real_account == "url_download":
+                real_account = account_name if account_name != "url_download" else "链接下载"
             # 记录到下载历史
             history.append({
                 "title": title,
                 "link": article.get("original_url") or link,
                 "account": real_account,
+                "author": result.get("author", ""),
                 "success": success,
                 "time": time.time(),
                 "error": error_msg if not success else None,

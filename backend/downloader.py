@@ -1435,6 +1435,7 @@ def download_single_article(url: str, out_dir: Path, title_hint: str = "", _redi
     return {
         "success": True,
         "title": safe_title,
+        "source": source,
         "author": author or source,
         "path": str(art_dir),
         "resources": len(url_map),
