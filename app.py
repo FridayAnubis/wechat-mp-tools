@@ -148,6 +148,22 @@ def save_settings():
     return jsonify({"message": "设置已保存"})
 
 
+@app.route("/healthz")
+def healthz():
+    """容器健康检查（桌面版也可用，方便统一探针）"""
+    from flask import jsonify
+    from backend.config import APP_VERSION
+    return jsonify({"status": "ok", "version": APP_VERSION, "mode": "full"})
+
+
+@app.route("/api/capabilities")
+def capabilities():
+    """完整版能力清单；公众号版由 app_mp.py 返回 mode=mp-only"""
+    from flask import jsonify
+    from backend.config import APP_VERSION
+    return jsonify({"mode": "full", "version": APP_VERSION})
+
+
 # ── 启动 ──────────────────────────────────────────────────
 
 def open_browser(port: int):

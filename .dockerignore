@@ -1,0 +1,39 @@
+# 构建上下文是仓库根目录，这里必须挡住用户数据与大文件
+.git
+.github
+.gitignore
+.DS_Store
+
+# 用户数据：cookie、账号、下载历史、已下载文章 —— 绝不进镜像
+data
+downloads
+updates
+
+# 本地虚拟环境与构建产物
+venv312
+dist
+build
+*.spec
+
+# 参考仓库、临时脚本、日志
+we-mp-rss
+scratch
+scratch_*.py
+scratch_*.html
+*.log
+deploy/_reference-we-mp-rss
+
+# 字幕擦除的 AI 模型，1.2GB，容器里用不到（runtime.py 里只是 exists() 探测，缺失不影响）
+backend/subtitle_remover
+
+# 缓存
+__pycache__
+*.pyc
+.pytest_cache
+
+# 文档与测试
+docs
+tests
+skills
+.claude
+.workbuddy-ai

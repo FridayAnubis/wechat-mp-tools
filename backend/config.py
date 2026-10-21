@@ -5,6 +5,7 @@
 
 import sys
 import json
+import os
 import time
 import random
 import string
@@ -14,7 +15,7 @@ from pathlib import Path
 from backend.runtime import app_dir
 
 # ── 版本号 ────────────────────────────────────────────────
-APP_VERSION = "2.2.4"
+APP_VERSION = "2.3.0"
 
 # ── 路径配置 ──────────────────────────────────────────────
 if getattr(sys, 'frozen', False):
@@ -62,6 +63,12 @@ DEFAULT_SETTINGS = {
     "rss_end_minute": 0,
     "rss_upload_enabled": False,
     "rss_upload_url": "",
+    # RSS 输出：单次条数上限（0 = 不限制，保持桌面版原有行为）、缓存秒数、
+    # 访问令牌（留空不鉴权）、对外地址
+    "rss_max_items": 0,
+    "rss_cache_ttl": 300,
+    "rss_token": "",
+    "rss_base_url": "",
     "weread_platform_url": WEREAD_PLATFORM_URL,
 }
 
@@ -102,6 +109,19 @@ def get_settings() -> dict:
     for key, val in DEFAULT_SETTINGS.items():
         if key not in settings:
             settings[key] = val
+
+    # 容器/迁移场景：设置里记的是另一台机器的绝对路径（比如桌面版的
+    # /Users/xxx/data/articles_full），在当前环境根本不存在，会导致下载失败。
+    # 这种情况下回落到环境变量 DOWNLOAD_DIR，不改写用户的设置文件。
+    env_dir = os.environ.get("DOWNLOAD_DIR", "").strip()
+    if env_dir:
+        current = str(settings.get("download_dir") or "")
+        try:
+            current_ok = bool(current) and Path(current).exists()
+        except OSError:
+            current_ok = False
+        if not current_ok:
+            settings["download_dir"] = env_dir
     return settings
 
 
