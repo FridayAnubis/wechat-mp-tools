@@ -1,0 +1,98 @@
+name: Build and publish MP Docker image
+
+on:
+  push:
+    branches:
+      - '**'
+  workflow_dispatch:
+
+concurrency:
+  group: docker-mp-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    # 手动运行也只接受分支，避免把 Git tag 当作分支名发布。
+    if: startsWith(github.ref, 'refs/heads/')
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: Prepare image tags
+        id: meta
+        env:
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import os
+          import re
+
+          image = f"ghcr.io/{os.environ['GITHUB_REPOSITORY'].lower()}-mp"
+          # Docker 标签只接受 ASCII；斜杠、括号等连续非法字符统一替换为 -。
+          branch = re.sub(r"[^a-z0-9_.-]+", "-", os.environ["GITHUB_REF_NAME"].lower())
+          branch = branch.strip(".-") or "branch"
+          # 标签上限 128 字符，给连字符与 7 位 SHA 留出 8 个字符。
+          tag = f"{branch[:120]}-{os.environ['GITHUB_SHA'][:7]}"
+          tags = [f"{image}:{tag}"]
+          if os.environ["GITHUB_REF_NAME"] == os.environ["DEFAULT_BRANCH"]:
+              tags.append(f"{image}:latest")
+
+          with open(os.environ["GITHUB_OUTPUT"], "a") as output:
+              output.write(f"image={image}\ntag={tag}\n")
+              output.write("tags<<EOF\n" + "\n".join(tags) + "\nEOF\n")
+          PY
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v4
+        with:
+          platforms: arm64
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push lightweight MP image
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: deploy/docker/Dockerfile
+          platforms: linux/amd64,linux/arm64
+          push: true
+          build-args: |
+            INSTALL_BROWSERS=0
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: |
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.title=WeChat MP Tools - MP and RSS
+          cache-from: type=gha,scope=docker-mp
+          cache-to: type=gha,mode=max,scope=docker-mp
+
+      - name: Show pull commands
+        env:
+          IMAGE_TAGS: ${{ steps.meta.outputs.tags }}
+        shell: bash
+        run: |
+          {
+            echo '### 公众号 + RSS 轻量镜像'
+            echo '支持 linux/amd64、linux/arm64，未安装 Chromium / Playwright / ffmpeg。'
+            echo '```bash'
+            while IFS= read -r image_tag; do
+              printf 'docker pull %s\n' "$image_tag"
+            done <<< "$IMAGE_TAGS"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
