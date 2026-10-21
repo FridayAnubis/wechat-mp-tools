@@ -21,6 +21,7 @@ from html.parser import HTMLParser
 from backend.config import (
     DEFAULT_HEADERS, get_proxies_dict, get_settings, report_proxy_status
 )
+from backend.wechat_url import normalize_wechat_short_url, short_id_from_review_id
 
 logger = logging.getLogger(__name__)
 
@@ -738,6 +739,7 @@ def clean_wechat_article_url(url: str) -> str:
     """清理公众号推文链接，去除引起风控识别的跟踪与环境参数 (参考 we-mp-rss 规范化清洗)"""
     if not url:
         return ""
+    url = normalize_wechat_short_url(url)
     try:
         from urllib.parse import urlparse, parse_qs, urlencode, urlunparse
         parsed = urlparse(url)
@@ -769,6 +771,7 @@ def resolve_canonical_short_url(url: str, review_id: str = "") -> str:
     """将微信长链接或 review_id 解析为免验证码风控的标准短链 (https://mp.weixin.qq.com/s/{short_id})"""
     if not url:
         return ""
+    url = normalize_wechat_short_url(url)
     if "/s/" in url and "__biz=" not in url:
         return url
 
@@ -776,13 +779,12 @@ def resolve_canonical_short_url(url: str, review_id: str = "") -> str:
     if cache_key in _canonical_url_cache:
         return _canonical_url_cache[cache_key]
 
-    # 1. 若 review_id 存在且包含下划线，提取其末尾的 short_id
-    if review_id and "_" in review_id:
-        sid = review_id.split("_")[-1]
-        if len(sid) >= 15:
-            res = f"https://mp.weixin.qq.com/s/{sid}"
-            _canonical_url_cache[cache_key] = res
-            return res
+    # 1. 从 review_id 的完整账号前缀后提取 short_id，保留下划线
+    sid = short_id_from_review_id(review_id)
+    if sid:
+        res = f"https://mp.weixin.qq.com/s/{sid}"
+        _canonical_url_cache[cache_key] = res
+        return res
 
     # 2. 调用微信读书接口通过 URL 查询 reviewId
     try:
@@ -792,12 +794,11 @@ def resolve_canonical_short_url(url: str, review_id: str = "") -> str:
         res = s.post("https://i.weread.qq.com/mp/getreviewid", json={"urls": [url]}, headers=h, timeout=6).json()
         for item in res.get("reviewIds", []):
             rid = item.get("reviewId", "")
-            if rid and "_" in rid:
-                sid = rid.split("_")[-1]
-                if len(sid) >= 15:
-                    resolved = f"https://mp.weixin.qq.com/s/{sid}"
-                    _canonical_url_cache[cache_key] = resolved
-                    return resolved
+            sid = short_id_from_review_id(rid)
+            if sid:
+                resolved = f"https://mp.weixin.qq.com/s/{sid}"
+                _canonical_url_cache[cache_key] = resolved
+                return resolved
     except Exception as e:
         logger.debug(f"[ShortURL] 解析推文短链异常: {e}")
 

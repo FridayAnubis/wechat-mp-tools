@@ -36,6 +36,7 @@ from backend.config import (
     load_json,
     normalize_wechat_url,
 )
+from backend.wechat_url import normalize_wechat_short_url
 
 RSS_ARTICLES_FILE = DATA_DIR / "rss_articles.json"
 
@@ -115,6 +116,7 @@ def _normalize_item(raw: dict, account: str) -> dict | None:
     if not isinstance(raw, dict):
         return None
     link = raw.get("link") or raw.get("url") or ""
+    link = normalize_wechat_short_url(str(link)) if link else ""
     title = raw.get("title") or ""
     if not link and not title:
         return None

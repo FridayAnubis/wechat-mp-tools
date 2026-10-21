@@ -25,6 +25,7 @@ from backend.config import (
 )
 from backend.account_pool import borrow_session, borrow_weread_session, account_pool, get_weread_session
 from backend.accounts import biz_to_book_id
+from backend.wechat_url import normalize_wechat_short_url, short_id_from_review_id
 from backend.runtime import desktop_available, host_path_hint
 
 articles_bp = Blueprint("articles", __name__, url_prefix="/api/articles")
@@ -74,10 +75,9 @@ def _resolve_review_doc_url(review_id: str, headers: dict) -> str:
         return ""
     # 优先直接使用 review_id 包含的短链标识（如 MP_WXS_2940696320_yvrxT0XE-9ELBG4gQZhB4g -> yvrxT0XE-9ELBG4gQZhB4g）
     # 短链在微信网关下直接返回文章内容，完全绕过长链接引发的风控验证码
-    if "_" in review_id:
-        sid = review_id.split("_")[-1]
-        if len(sid) >= 15:
-            return f"https://mp.weixin.qq.com/s/{sid}"
+    short_id = short_id_from_review_id(review_id)
+    if short_id:
+        return f"https://mp.weixin.qq.com/s/{short_id}"
 
     with _review_cache_lock:
         if review_id in _review_url_cache:
@@ -90,9 +90,9 @@ def _resolve_review_doc_url(review_id: str, headers: dict) -> str:
             mp_info = resp.json().get("review", {}).get("mpInfo", {})
             orig_id = mp_info.get("originalId", "")
             if orig_id and len(orig_id) >= 15:
-                doc_url = f"https://mp.weixin.qq.com/s/{orig_id}"
+                doc_url = normalize_wechat_short_url(f"https://mp.weixin.qq.com/s/{orig_id}")
             else:
-                doc_url = mp_info.get("doc_url", "")
+                doc_url = normalize_wechat_short_url(mp_info.get("doc_url", ""))
             if doc_url:
                 with _review_cache_lock:
                     _review_url_cache[review_id] = doc_url
@@ -250,11 +250,10 @@ def _fetch_articles_page(fakeid: str, begin: int, count: int, keyword: str = "",
         import concurrent.futures
         def _get_url(it):
             rid = it.get("reviewId", "")
-            if rid and "_" in rid:
-                sid = rid.split("_")[-1]
-                if len(sid) >= 15:
-                    return f"https://mp.weixin.qq.com/s/{sid}"
-            doc_u = it.get("mpInfo", {}).get("doc_url", "")
+            short_id = short_id_from_review_id(rid)
+            if short_id:
+                return f"https://mp.weixin.qq.com/s/{short_id}"
+            doc_u = normalize_wechat_short_url(it.get("mpInfo", {}).get("doc_url", ""))
             if doc_u:
                 return doc_u
             return _resolve_review_doc_url(rid, active_headers or {})
@@ -505,6 +504,8 @@ def download_by_url():
     if not extracted_urls:
         return jsonify({"error": "未检测到有效的微信公众号文章链接"}), 400
 
+    extracted_urls = list(dict.fromkeys(normalize_wechat_short_url(u) for u in extracted_urls))
+
     # 批量将长链接预解析为免风控的标准短链与 reviewId
     url_info_map = {}
     long_urls_to_resolve = [u for u in extracted_urls if "__biz=" in u]
@@ -517,13 +518,12 @@ def download_by_url():
             for r_item in res.get("reviewIds", []):
                 orig_u = r_item.get("url", "")
                 rid = r_item.get("reviewId", "")
-                if rid and "_" in rid:
-                    sid = rid.split("_")[-1]
-                    if len(sid) >= 15:
-                        url_info_map[orig_u] = {
-                            "short_url": f"https://mp.weixin.qq.com/s/{sid}",
-                            "review_id": rid,
-                        }
+                short_id = short_id_from_review_id(rid)
+                if short_id:
+                    url_info_map[orig_u] = {
+                        "short_url": f"https://mp.weixin.qq.com/s/{short_id}",
+                        "review_id": rid,
+                    }
         except Exception as e:
             logger.debug(f"[download_by_url] 批量预解析短链异常: {e}")
 
@@ -870,7 +870,7 @@ def _do_batch_download(task_id: str, articles: list, account_name: str):
                     save_json(DOWNLOAD_HISTORY_FILE, history)
                     return
 
-            link = article.get("link", "")
+            link = normalize_wechat_short_url(article.get("link", ""))
             title = article.get("title", f"article_{i+1}")
 
             with _download_lock:
@@ -925,7 +925,7 @@ def _do_batch_download(task_id: str, articles: list, account_name: str):
             # 记录到下载历史
             history.append({
                 "title": title,
-                "link": article.get("original_url") or link,
+                "link": normalize_wechat_short_url(article.get("original_url") or link),
                 "account": real_account,
                 "author": result.get("author", ""),
                 "success": success,
@@ -976,7 +976,7 @@ def _download_article_into_task(task_id: str, article: dict, account_name: str, 
     out_dir = download_dir / account_name
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    link = article.get("link", "")
+    link = normalize_wechat_short_url(article.get("link", ""))
     title = article.get("title", f"article_{index + 1}")
     review_id = article.get("id") or article.get("aid") or ""
 
