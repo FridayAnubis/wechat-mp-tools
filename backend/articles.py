@@ -1456,40 +1456,6 @@ def serve_file(filepath=""):
     return send_from_directory(target_path.parent, target_path.name)
 
 
-def _find_article_html(art_dir: Path) -> Path | None:
-    """定位文章目录中实际保存的离线 HTML"""
-    if not art_dir.is_dir():
-        return None
-    candidates = sorted(f for f in art_dir.glob("*.html") if not f.name.endswith("_raw.html"))
-    for c in candidates:
-        if c.stem == art_dir.name:
-            return c
-    return candidates[0] if candidates else None
-
-
-_RSS_STRIP_BLOCKS = re.compile(r"<(script|style|iframe|noscript)\b[^>]*>.*?</\1\s*>", re.IGNORECASE | re.DOTALL)
-_RSS_EVENT_ATTRS = re.compile(r"""\s+on[a-z]+\s*=\s*(?:"[^"]*"|'[^']*'|[^\s>]+)""", re.IGNORECASE)
-_RSS_RELATIVE_URL = re.compile(r"""(\s(?:src|href|poster)\s*=\s*)(["'])(?!(?:[a-z][a-z0-9+.-]*:|//|#))([^"']+)\2""", re.IGNORECASE)
-_RSS_RELATIVE_CSS_URL = re.compile(r"""(url\(\s*(?:&quot;|["'])?)(media/[^)"'&]+)""", re.IGNORECASE)
-
-
-def _rss_article_body(html_text: str, base_url: str) -> str:
-    """提取离线 HTML 的 #js_content 正文，之前的会丢失富文本"""
-    start = re.search(r'<div id="js_content"[^>]*>', html_text)
-    if start:
-        end = html_text.rfind("</div>")
-        body = html_text[start.end():end if end > start.end() else None]
-    else:
-        m = re.search(r"<body[^>]*>(.*)</body>", html_text, re.IGNORECASE | re.DOTALL)
-        body = m.group(1) if m else html_text
-    body = _RSS_STRIP_BLOCKS.sub("", body)
-    body = _RSS_EVENT_ATTRS.sub("", body)
-    body = _RSS_RELATIVE_URL.sub(
-        lambda m: f"{m.group(1)}{m.group(2)}{base_url}{urllib.parse.quote(m.group(3), safe='/%?=&;')}{m.group(2)}",
-        body,
-    )
-    body = _RSS_RELATIVE_CSS_URL.sub(lambda m: f"{m.group(1)}{base_url}{urllib.parse.quote(m.group(2))}", body)
-    return body.strip()
 
 
 @articles_bp.route("/rss", methods=["GET"])
