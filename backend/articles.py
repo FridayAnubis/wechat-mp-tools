@@ -1461,6 +1461,13 @@ def serve_file(filepath=""):
 
 
 
+@articles_bp.route("/avatars/<filename>", methods=["GET"])
+def get_account_avatar_file(filename):
+    from backend.avatar_cache import avatar_response
+
+    return avatar_response(filename)
+
+
 @articles_bp.route("/rss", methods=["GET"])
 @articles_bp.route("/rss/<account>", methods=["GET"])
 def get_rss(account=None):
