@@ -885,12 +885,16 @@ def _do_batch_download(task_id: str, articles: list, account_name: str):
                         "title": title, "success": False, "error": error_msg
                     })
 
-            real_account = result.get("author") or (account_name if account_name != "url_download" else "链接下载")
+            # 按公众号（source）分组，而非文章署名（author）——同一公众号的文章署名可能各不相同
+            real_account = result.get("source")
+            if not real_account or real_account == "url_download":
+                real_account = account_name if account_name != "url_download" else "链接下载"
             # 记录到下载历史
             history.append({
                 "title": title,
                 "link": article.get("original_url") or link,
                 "account": real_account,
+                "author": result.get("author", ""),
                 "success": success,
                 "time": time.time(),
                 "error": error_msg if not success else None,
@@ -1347,6 +1351,43 @@ def serve_file(filepath=""):
     return send_from_directory(target_path.parent, target_path.name)
 
 
+def _find_article_html(art_dir: Path) -> Path | None:
+    """定位文章目录中实际保存的离线 HTML（同名文章目录可能为 `标题_1`，但文件仍叫 `标题.html`）"""
+    if not art_dir.is_dir():
+        return None
+    candidates = sorted(f for f in art_dir.glob("*.html") if not f.name.endswith("_raw.html"))
+    for c in candidates:
+        if c.stem == art_dir.name:
+            return c
+    return candidates[0] if candidates else None
+
+
+_RSS_STRIP_BLOCKS = re.compile(r"<(script|style|iframe|noscript)\b[^>]*>.*?</\1\s*>", re.IGNORECASE | re.DOTALL)
+_RSS_EVENT_ATTRS = re.compile(r"""\s+on[a-z]+\s*=\s*(?:"[^"]*"|'[^']*'|[^\s>]+)""", re.IGNORECASE)
+_RSS_RELATIVE_URL = re.compile(r"""(\s(?:src|href|poster)\s*=\s*)(["'])(?!(?:[a-z][a-z0-9+.-]*:|//|#))([^"']+)\2""", re.IGNORECASE)
+_RSS_RELATIVE_CSS_URL = re.compile(r"""(url\(\s*(?:&quot;|["'])?)(media/[^)"'&]+)""", re.IGNORECASE)
+
+
+def _rss_article_body(html_text: str, base_url: str) -> str:
+    """提取离线 HTML 的 #js_content 正文，供 RSS content:encoded 使用（保留富文本结构与内联样式）"""
+    start = re.search(r'<div id="js_content"[^>]*>', html_text)
+    if start:
+        end = html_text.rfind("</div>")
+        body = html_text[start.end():end if end > start.end() else None]
+    else:
+        m = re.search(r"<body[^>]*>(.*)</body>", html_text, re.IGNORECASE | re.DOTALL)
+        body = m.group(1) if m else html_text
+    body = _RSS_STRIP_BLOCKS.sub("", body)
+    body = _RSS_EVENT_ATTRS.sub("", body)
+    # 本地媒体（media/xxx.jpg）改写为可公开访问的绝对地址
+    body = _RSS_RELATIVE_URL.sub(
+        lambda m: f"{m.group(1)}{m.group(2)}{base_url}{urllib.parse.quote(m.group(3), safe='/%?=&;')}{m.group(2)}",
+        body,
+    )
+    body = _RSS_RELATIVE_CSS_URL.sub(lambda m: f"{m.group(1)}{base_url}{urllib.parse.quote(m.group(2))}", body)
+    return body.strip()
+
+
 @articles_bp.route("/rss", methods=["GET"])
 @articles_bp.route("/rss/<account>", methods=["GET"])
 def get_rss(account=None):
@@ -1374,23 +1415,25 @@ def get_rss(account=None):
     # Merge auto-fetched RSS articles
     try:
         from backend.rss_scheduler import rss_scheduler
+        # (公众号名称, 文章) 对：归属取订阅的公众号名称，而不是文章署名
         if account:
-            rss_arts = rss_scheduler.get_articles(account)
+            rss_arts = [(account, art) for art in rss_scheduler.get_articles(account)]
         else:
             # Get articles from all subscriptions
             rss_arts = []
             for sub in rss_scheduler.get_subscriptions():
-                rss_arts.extend(rss_scheduler.get_articles(sub.get("nickname", "")))
+                nickname = sub.get("nickname", "")
+                rss_arts.extend((nickname, art) for art in rss_scheduler.get_articles(nickname))
 
         # Convert auto-fetched articles to the same format, dedup by link
         existing_links = {item.get("link") for item in items if item.get("link")}
-        for art in rss_arts:
+        for nickname, art in rss_arts:
             link = art.get("link", "")
             if link and link not in existing_links:
                 items.append({
                     "title": art.get("title", ""),
                     "link": link,
-                    "account": account or art.get("author", ""),
+                    "account": nickname,
                     "success": True,
                     "time": art.get("update_time", 0),
                     "publish_time": art.get("update_time", 0),
@@ -1419,24 +1462,23 @@ def get_rss(account=None):
         
         safe_title = item.get("title") or ""
         
-        # Check if local HTML file exists
-        local_exists = False
+        # Locate the actually saved local HTML file
         path_str = item.get("path")
+        html_file = None
         if path_str:
             try:
-                local_path = Path(path_str)
-                if local_path.exists():
-                    local_exists = True
+                html_file = _find_article_html(Path(path_str))
             except Exception:
                 pass
 
         orig_url_val = item.get("link") or ""
         orig_url = html.escape(str(orig_url_val))
 
-        if local_exists:
-            p_obj = Path(path_str)
-            local_url = f"{host_url}api/articles/serve-file/{quote(p_obj.parent.name)}/{quote(p_obj.name)}/{quote(p_obj.name)}.html"
-            xml_link = html.escape(local_url)
+        art_base_url = ""
+        if html_file:
+            p_obj = html_file.parent
+            art_base_url = f"{host_url}api/articles/serve-file/{quote(p_obj.parent.name)}/{quote(p_obj.name)}/"
+            xml_link = html.escape(f"{art_base_url}{quote(html_file.name)}")
         else:
             xml_link = orig_url
         
@@ -1453,26 +1495,39 @@ def get_rss(account=None):
         cover_url_val = item.get("cover_url") or ""
         cover_url = html.escape(str(cover_url_val))
         
-        # Read content.txt if available for full text
-        content_encoded = ""
-        if path_str:
-            try:
+        # Full text: prefer rich HTML body (keeps layout & images), fall back to content.txt
+        content_body = ""
+        try:
+            if html_file:
+                content_body = _rss_article_body(html_file.read_text(encoding="utf-8"), art_base_url)
+            if not content_body and path_str:
                 txt_path = Path(path_str) / "content.txt"
                 if txt_path.exists():
-                    clean_text = txt_path.read_text(encoding="utf-8")
-                    clean_text = clean_text.replace("]]>", "]]&gt;")
-                    content_encoded = f"<content:encoded><![CDATA[{clean_text}]]></content:encoded>"
-            except Exception:
-                pass
+                    lines = txt_path.read_text(encoding="utf-8").splitlines()
+                    content_body = "\n".join(f"<p>{html.escape(ln)}</p>" for ln in lines if ln.strip())
+        except Exception:
+            pass
+        content_encoded = ""
+        if content_body:
+            content_body = content_body.replace("]]>", "]]&gt;")
+            content_encoded = f"<content:encoded><![CDATA[{content_body}]]></content:encoded>"
                 
         enclosure = f'<enclosure url="{cover_url}" type="image/jpeg" length="0"/>' if cover_url else ""
-        
+
+        # 文章署名单独输出为 dc:creator，不参与订阅分组
+        author_val = item.get("author") or ""
+        if not author_val and html_file:
+            meta = load_json(html_file.parent / "metadata.json", {})
+            author_val = meta.get("author", "") if isinstance(meta, dict) else ""
+        creator = f"<dc:creator>{html.escape(str(author_val))}</dc:creator>" if author_val else ""
+
         xml_items.append(f"""    <item>
       <title>{title}</title>
       <link>{xml_link}</link>
       <guid isPermaLink="false">{orig_url or xml_link}</guid>
       <pubDate>{pub_date}</pubDate>
       <description>{digest}</description>
+      {creator}
       {enclosure}
       {content_encoded}
     </item>""")
@@ -1480,7 +1535,7 @@ def get_rss(account=None):
     items_str = "\n".join(xml_items)
     
     rss_xml = f"""<?xml version="1.0" encoding="utf-8"?>
-<rss version="2.0" xmlns:content="http://purl.org/rss/1.0/modules/content/">
+<rss version="2.0" xmlns:content="http://purl.org/rss/1.0/modules/content/" xmlns:dc="http://purl.org/dc/elements/1.1/">
   <channel>
     <title>{html.escape(feed_title)}</title>
     <link>{html.escape(host_url)}</link>
