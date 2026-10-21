@@ -9,6 +9,7 @@ import os
 import time
 import random
 import string
+import tempfile
 import threading
 from pathlib import Path
 
@@ -23,7 +24,8 @@ if getattr(sys, 'frozen', False):
     SCRIPT_DIR = app_dir()
 else:
     SCRIPT_DIR = Path(__file__).resolve().parent.parent
-DATA_DIR = SCRIPT_DIR / "data"
+# WECHAT_MP_DATA_DIR 仅用于测试 / 特殊部署时把数据目录整体挪走；未设置时行为不变
+DATA_DIR = Path(os.environ.get("WECHAT_MP_DATA_DIR") or (SCRIPT_DIR / "data"))
 OUTPUT_DIR = DATA_DIR / "articles_full"
 CONFIG_FILE = DATA_DIR / "wechat_mp_config.json"
 ACCOUNTS_FILE = DATA_DIR / "accounts.json"
@@ -72,6 +74,21 @@ DEFAULT_SETTINGS = {
     "rss_local_avatar": True,
     "rss_avatar_from_article": True,
     "weread_platform_url": WEREAD_PLATFORM_URL,
+    # 历史文章渐进回溯（见 backend/history_backfill.py、docs/history_backfill.md）
+    # 以下均为保守起点，不是平台保证的安全阈值
+    "backfill_auto_enabled": False,           # 空闲自动回溯总开关，默认关闭；不影响手动「获取历史」
+    "backfill_scan_batch_size": 10,           # 单轮最多扫描的原始章节条目
+    "backfill_daily_download_limit": 40,      # 单公众号每日实际下载上限
+    "backfill_min_interval_minutes": 10,      # 同一公众号两次历史批次的最小间隔
+    "backfill_download_workers": 1,           # 历史下载并发（固定串行，保留字段便于展示）
+    "backfill_page_overlap": 5,               # 重叠读取条数，用于锚点定位与列表漂移校验
+    "backfill_rss_guard_seconds": 120,        # RSS 下一轮到期前多少秒内不启动历史请求
+    "backfill_request_interval_seconds": 5,   # 历史回溯两次上游请求之间的最小间隔（秒）
+    "backfill_max_attempts": 3,               # 单篇历史文章正文下载的最大尝试次数
+    "backfill_start_hour": 0,                 # 自动回溯允许时段（小时，含）
+    "backfill_end_hour": 24,                  # 自动回溯允许时段（小时，不含）
+    "rss_include_backfill": False,            # 最新 RSS Feed 默认排除回溯补抓的旧文章
+    "backfill_upload_enabled": False,         # RSS 上传默认不携带回溯补抓的旧文章
 }
 
 
@@ -95,13 +112,67 @@ def load_json(filepath: Path, default=None):
 
 
 def save_json(filepath: Path, data):
-    """安全地保存 JSON 文件"""
+    """安全地保存 JSON 文件（先写同目录临时文件再原子替换，避免写到一半被读到或断电留下半个文件）"""
+    filepath = Path(filepath)
     filepath.parent.mkdir(parents=True, exist_ok=True)
-    filepath.write_text(
-        json.dumps(data, ensure_ascii=False, indent=2),
-        encoding="utf-8",
-        errors="replace"
-    )
+    payload = json.dumps(data, ensure_ascii=False, indent=2).encode("utf-8", errors="replace")
+    fd, tmp_name = tempfile.mkstemp(prefix=f".{filepath.name}.", suffix=".tmp", dir=str(filepath.parent))
+    try:
+        with os.fdopen(fd, "wb") as fh:
+            fh.write(payload)
+            fh.flush()
+            os.fsync(fh.fileno())
+        for attempt in range(5):
+            try:
+                os.replace(tmp_name, filepath)
+                break
+            except PermissionError:
+                # Windows 下目标文件正被其他线程读取时 replace 会失败，稍等重试；最后回落为直接覆盖写
+                if attempt == 4:
+                    filepath.write_bytes(payload)
+                    os.unlink(tmp_name)
+                    break
+                time.sleep(0.05 * (attempt + 1))
+    except BaseException:
+        try:
+            os.unlink(tmp_name)
+        except OSError:
+            pass
+        raise
+
+
+# ── 下载历史统一写入 ──────────────────────────────────────
+# download_history.json 由手动下载、RSS 定时抓取、历史回溯三条线程路径共同读改写，
+# 以前各自加锁（甚至不加锁）且「开头读一次、结尾整体写回」，会互相覆盖对方的新记录。
+# 现在所有写入都必须经过这把进程内共享锁，并在锁内重新读取磁盘最新版本。
+DOWNLOAD_HISTORY_LOCK = threading.RLock()
+
+
+def update_download_history(mutator):
+    """在共享锁内读取最新下载历史 → 调用 mutator(history) 原地修改 → 原子写回。
+
+    mutator 的返回值原样返回；返回 False 时表示无改动，跳过写盘。
+    """
+    with DOWNLOAD_HISTORY_LOCK:
+        history = load_json(DOWNLOAD_HISTORY_FILE, [])
+        if not isinstance(history, list):
+            history = []
+        result = mutator(history)
+        if result is not False:
+            save_json(DOWNLOAD_HISTORY_FILE, history)
+        return result
+
+
+def append_download_history(records: list):
+    """把新的下载记录追加到下载历史（锁内重新读取，不覆盖其他线程的写入）"""
+    records = [r for r in (records or []) if isinstance(r, dict)]
+    if not records:
+        return
+
+    def _append(history):
+        history.extend(records)
+
+    update_download_history(_append)
 
 
 def get_settings() -> dict:

@@ -1394,6 +1394,10 @@ body {
     animation: fadeIn 0.15s ease;
 }
 
+body:has(#backfill-modal-overlay) > #modal-overlay.active {
+    z-index: 10001;
+}
+
 .modal-dialog {
     background: var(--bg-secondary);
     border: 1px solid var(--border-color);
@@ -1937,5 +1941,17 @@ body {
     }
 }
 
+.btn.backfill-btn {
+    background: rgba(87, 107, 149, 0.12);
+    color: #576b95;
+    border: 1px solid rgba(87, 107, 149, 0.28);
+}
 
+.btn.backfill-btn:hover {
+    background: rgba(87, 107, 149, 0.2);
+}
 
+.backfill-badge {
+    font-size: 0.72rem;
+    opacity: 0.85;
+}

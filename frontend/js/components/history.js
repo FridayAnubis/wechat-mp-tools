@@ -6,6 +6,10 @@ const HistoryPage = {
     filteredItems: [], // 当前过滤后的记录
     activeIndex: -1, // 当前选择阅读的索引
     uniqueAccounts: [], // 所有唯一的公众号名称
+    pageSize: 200, // 服务端分页：每次加载的条数（历史回溯后记录可能上万条，不再一次性全量加载）
+    total: 0,
+    hasMore: false,
+    loadingMore: false,
 
     render() {
         return `
@@ -356,29 +360,27 @@ const HistoryPage = {
         this.loadHistory();
     },
 
-    async loadHistory() {
+    async loadHistory(append = false) {
         try {
-            const data = await API.articles.history(999999);
-            const history = data.history || [];
+            const account = document.getElementById('history-account-filter')?.value || '';
+            // 刷新时保留已经加载的条数，避免用户翻到后面后又被截回第一页
+            const limit = append ? this.pageSize : Math.max(this.pageSize, append ? 0 : this.items.length);
+            const offset = append ? this.items.length : 0;
+            // view=reader：只返回成功落盘或永久性失败（作者已删除/内容被屏蔽/链接已过期）的条目；sort=publish：按发布时间倒序
+            const data = await API.articles.history(limit, { offset, view: 'reader', sort: 'publish', account });
+            const page = data.history || [];
 
-            // 过滤成功且包含可用文件路径的条目，或者永久性失败的条目（比如作者已删除/内容被屏蔽/链接已过期）
-            this.items = history.filter(item => 
-                (item.success && item.path) || 
-                (!item.success && item.error && (item.error.includes("删除") || item.error.includes("屏蔽") || item.error.includes("过期")))
-            );
-            
-            // 按文章的发布时间（或下载时间）进行降序排序（最新发布的在前）
-            this.items.sort((a, b) => {
-                const timeA = a.publish_time || a.time || 0;
-                const timeB = b.publish_time || b.time || 0;
-                return timeB - timeA;
-            });
-            
-            // 提取所有唯一的公众号名称
-            this.uniqueAccounts = [...new Set(this.items.map(item => item.account).filter(Boolean))];
+            this.items = append ? this.items.concat(page) : page;
+            this.total = data.total || this.items.length;
+            this.hasMore = !!data.has_more;
+
+            // 公众号筛选项由服务端统计全部记录得出（不受分页影响）
+            this.uniqueAccounts = data.accounts || [...new Set(this.items.map(item => item.account).filter(Boolean))];
 
             this.updateAccountFilter();
-            this.filterHistory(document.getElementById('history-account-filter')?.value || "");
+            this.filteredItems = [...this.items];
+            this.updateTotalBadge();
+            this.renderList();
 
         } catch (err) {
             console.error('加载历史记录失败:', err);
@@ -386,6 +388,25 @@ const HistoryPage = {
             if (container) {
                 container.innerHTML = '<div style="text-align: center; color: var(--text-muted); padding: 20px;">加载失败</div>';
             }
+        }
+    },
+
+    async loadMore() {
+        if (this.loadingMore || !this.hasMore) return;
+        this.loadingMore = true;
+        const btn = document.getElementById('history-load-more');
+        if (btn) { btn.disabled = true; btn.textContent = '加载中...'; }
+        try {
+            await this.loadHistory(true);
+        } finally {
+            this.loadingMore = false;
+        }
+    },
+
+    updateTotalBadge() {
+        const badge = document.getElementById('history-total-badge');
+        if (badge) {
+            badge.textContent = this.hasMore ? `已加载 ${this.items.length} / 共 ${this.total} 篇` : `共 ${this.total} 篇`;
         }
     },
 
@@ -408,19 +429,11 @@ const HistoryPage = {
     },
 
     filterHistory(account) {
-        if (account) {
-            this.filteredItems = this.items.filter(item => item.account === account);
-        } else {
-            this.filteredItems = [...this.items];
-        }
-
-        // 更新徽章数量
-        const badge = document.getElementById('history-total-badge');
-        if (badge) {
-            badge.textContent = `共 ${this.filteredItems.length} 篇`;
-        }
-
-        this.renderList();
+        // 公众号筛选改为服务端过滤：重新从第一页加载
+        this.items = [];
+        this.activeIndex = -1;
+        this.activeArticlePath = null;
+        this.loadHistory(false);
     },
 
     renderList() {
@@ -502,6 +515,16 @@ const HistoryPage = {
                 </div>
             `;
         });
+
+        if (this.hasMore) {
+            html += `
+                <div style="text-align: center; padding: 8px 0 4px;">
+                    <button class="btn btn-secondary btn-sm" id="history-load-more" onclick="HistoryPage.loadMore()">
+                        加载更多（已加载 ${this.items.length} / 共 ${this.total} 篇）
+                    </button>
+                </div>
+            `;
+        }
 
         container.innerHTML = html;
 

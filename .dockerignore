@@ -11,6 +11,8 @@ updates
 
 # 本地虚拟环境与构建产物
 venv312
+venv*/
+.venv/
 dist
 build
 *.spec

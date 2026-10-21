@@ -15,6 +15,8 @@
 """
 
 import argparse
+import atexit
+import signal
 import os
 import sys
 from pathlib import Path
@@ -33,13 +35,16 @@ from backend.accounts import accounts_bp
 from backend.articles import articles_bp
 from backend.auth import auth_bp
 from backend.config import APP_VERSION, ensure_dirs, get_settings, save_settings
+from backend.history_backfill_api import backfill_bp
 from backend.proxy import proxy_bp
+from backend.waterwall import waterwall_bp
 
 ENABLED_MODULES = [
     "公众号登录（微信读书扫码）",
     "公众号账号与文章列表",
     "文章下载 / 导出（HTML / Markdown / PDF）",
     "RSS 订阅与定时增量抓取",
+    "公众号历史文章渐进回溯",
     "代理配置",
 ]
 
@@ -55,6 +60,9 @@ app.register_blueprint(accounts_bp)
 app.register_blueprint(articles_bp)
 app.register_blueprint(account_pool_bp)
 app.register_blueprint(proxy_bp)
+app.register_blueprint(backfill_bp)
+# 防水墙验证码状态 / 人工验证接口：历史回溯遇到验证码会暂停并提示人工处理，需要它解除拦截
+app.register_blueprint(waterwall_bp)
 
 migrate_legacy_config()
 
@@ -65,6 +73,15 @@ try:
     rss_scheduler.start()
 except Exception as exc:  # noqa: BLE001
     print(f"[warn] RSS 调度器启动失败：{exc}", file=sys.stderr)
+
+# 历史回溯（后台线程；自动回溯默认关闭，只处理手动「获取历史」任务；失败不影响服务启动）
+try:
+    from backend.history_backfill import backfill_scheduler
+
+    backfill_scheduler.start()
+    atexit.register(backfill_scheduler.stop)
+except Exception as exc:  # noqa: BLE001
+    print(f"[warn] 历史回溯调度器启动失败：{exc}", file=sys.stderr)
 
 
 # ── 基础接口 ──────────────────────────────────────────────
@@ -140,6 +157,7 @@ def serve_static(path):
 
 
 def main():
+    signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
     parser = argparse.ArgumentParser(description="微信公众号 + RSS 服务")
     parser.add_argument("--port", type=int, default=int(os.environ.get("PORT", 5200)))
     parser.add_argument("--host", type=str, default=os.environ.get("HOST", "127.0.0.1"))

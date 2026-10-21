@@ -12,6 +12,13 @@ deploy/rss/README.md，核心是四点：
    content.txt、重新拼字符串。
 4. 反向代理下用 X-Forwarded-* 或显式 rss_base_url 生成链接。原实现用
    request.host_url，容器/反代后面会生成 http://内网地址 的订阅链接。
+
+历史回溯（backend/history_backfill.py）引入后：
+5. 订阅缓存改从持久化文章索引 data/backfill.db 读取，不再有单公众号 200 篇截断；
+   索引不可用时回落到 rss_articles.json。
+6. 历史回溯补抓的旧文章默认不进入「最新更新」Feed（rss_include_backfill=false），
+   避免一次回溯把几百篇旧文章当作新内容推给阅读器；请求时可用
+   ?include_backfill=1 单独获取包含回溯文章的完整归档 Feed。
 """
 
 from __future__ import annotations
@@ -54,14 +61,28 @@ _cache_lock = threading.Lock()
 # ---------------------------------------------------------------- 数据加载
 
 
+def _archive_store():
+    try:
+        from backend.backfill_store import get_store
+
+        return get_store()
+    except Exception:  # noqa: BLE001 —— 索引不可用时回落到旧 JSON
+        return None
+
+
 def _file_mtimes() -> tuple:
-    """文章与公众号元数据三个文件的修改时间，作为缓存失效依据。"""
+    """文章与公众号元数据三个文件的修改时间 + 文章索引版本号，作为缓存失效依据。"""
     out = []
     for path in (DOWNLOAD_HISTORY_FILE, RSS_ARTICLES_FILE, ACCOUNTS_FILE):
         try:
             out.append(path.stat().st_mtime_ns)
         except OSError:
             out.append(0)
+    store = _archive_store()
+    try:
+        out.append(store.feed_version() if store is not None else 0)
+    except Exception:  # noqa: BLE001
+        out.append(0)
     return tuple(out)
 
 
@@ -95,12 +116,18 @@ def get_account_avatar(account: str, items: list | None = None,
     return ""
 
 
-def _load_all_articles() -> dict:
-    """一次性读出 {公众号: [文章...]}，不按账号重复解析。"""
+def _load_all_articles(account: str | None = None) -> dict:
+    """一次性读出 {公众号: [文章...]}（订阅缓存视图，不截断）；指定 account 时只查该公众号。"""
+    store = _archive_store()
+    if store is not None:
+        try:
+            return store.rss_cached_articles(account)
+        except Exception:  # noqa: BLE001
+            pass
     data = load_json(RSS_ARTICLES_FILE, {})
     if not isinstance(data, dict):
         return {}
-    return {k: v for k, v in data.items() if isinstance(v, list)}
+    return {k: v for k, v in data.items() if isinstance(v, list) and (not account or k == account)}
 
 
 def _load_history() -> list:
@@ -188,10 +215,25 @@ def _normalize_item(raw: dict, account: str) -> dict | None:
     }
 
 
-def collect_items(account: str | None = None) -> list:
-    """合并「手动下载历史」与「订阅抓取缓存」，按链接去重、按时间倒序。"""
-    articles = _load_all_articles()
-    history = _load_history()
+def collect_items(account: str | None = None, include_backfill: bool | None = None,
+                  limit: int = 0, offset: int = 0) -> list:
+    """合并「手动下载历史」与「订阅抓取缓存」，按链接去重、按时间倒序。
+
+    include_backfill 为 None 时跟随设置 rss_include_backfill（默认 False）：
+    历史回溯补抓的旧文章（下载历史中 backfill=True）不进入最新更新 Feed。
+    """
+    if include_backfill is None:
+        include_backfill = _cfg_bool(get_settings(), "rss_include_backfill", "RSS_INCLUDE_BACKFILL", False)
+    store = _archive_store()
+    if store is not None:
+        store.sync_history_file()
+        rows = store.feed_page(account, include_backfill=include_backfill, limit=limit, offset=offset)
+        return [item for row in rows if (item := _normalize_item(row, row["account"]))]
+    articles = _load_all_articles(account)
+    history = [
+        h for h in _load_history()
+        if isinstance(h, dict) and (include_backfill or not h.get("backfill"))
+    ]
 
     merged: dict = {}
     order: list = []
@@ -233,7 +275,7 @@ def collect_items(account: str | None = None) -> list:
 
     items = [merged[k] for k in order]
     items.sort(key=lambda x: x["published"], reverse=True)
-    return items
+    return items[offset:] if limit <= 0 else items[offset:offset + limit]
 
 
 # ---------------------------------------------------------------- XML 渲染
@@ -447,28 +489,28 @@ def _check_token(request, settings: dict):
 
 
 def build_feed(account: str | None, limit: int, offset: int,
-               fulltext: bool, base_url: str) -> tuple[str, str]:
+               fulltext: bool, base_url: str, include_backfill: bool | None = None) -> tuple[str, str]:
     """返回 (xml, etag)，结果按 (参数 + 文件 mtime) 缓存在进程内。"""
     settings = get_settings()
     ttl = _cfg_int(settings, "rss_cache_ttl", "RSS_CACHE_TTL", DEFAULT_TTL)
     local_avatar = _cfg_bool(settings, "rss_local_avatar", "RSS_LOCAL_AVATAR", True)
     from_article = _cfg_bool(settings, "rss_avatar_from_article", "RSS_AVATAR_FROM_ARTICLE", True)
+    if include_backfill is None:
+        include_backfill = _cfg_bool(settings, "rss_include_backfill", "RSS_INCLUDE_BACKFILL", False)
     key = (account or "", limit, offset, bool(fulltext), base_url,
-           local_avatar, from_article, _file_mtimes())
+           local_avatar, from_article, bool(include_backfill), _file_mtimes())
 
     with _cache_lock:
         hit = _cache.get(key)
         if hit and (ttl <= 0 or time.time() - hit[0] < ttl):
             return hit[1], hit[2]
 
-    items = collect_items(account)
-    # limit <= 0 表示不限制（桌面版默认），返回 offset 之后的全部
-    window = items[offset:] if limit <= 0 else items[offset:offset + limit]
+    window = collect_items(account, include_backfill=include_backfill, limit=limit, offset=offset)
 
     if account:
         title = account
         description = f"{account}的微信公众号文章"
-        image_url = get_account_avatar(account, items, from_article=from_article)
+        image_url = get_account_avatar(account, window, from_article=from_article)
         if image_url and local_avatar:
             filename = cache_avatar(image_url)
             if filename:
@@ -514,8 +556,14 @@ def rss_response(request, account: str | None = None) -> Response:
 
     fulltext = str(request.args.get("full", "1")).lower() not in ("0", "false", "no")
 
+    # ?include_backfill=1 单独获取包含历史回溯旧文章的完整归档 Feed；不传则跟随设置
+    raw_ib = request.args.get("include_backfill")
+    include_backfill = None
+    if raw_ib is not None and str(raw_ib).strip() != "":
+        include_backfill = str(raw_ib).strip().lower() not in ("0", "false", "no", "off")
+
     base_url = _resolve_base_url(request, settings)
-    xml, etag = build_feed(account, limit, offset, fulltext, base_url)
+    xml, etag = build_feed(account, limit, offset, fulltext, base_url, include_backfill=include_backfill)
 
     ttl = _cfg_int(settings, "rss_cache_ttl", "RSS_CACHE_TTL", DEFAULT_TTL)
     mtime_ns = max(_file_mtimes()) or 0

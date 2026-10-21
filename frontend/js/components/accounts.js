@@ -92,32 +92,37 @@ const AccountsPage = {
         }
 
         container.innerHTML = this.accounts.map(acc => {
-            const safeName = acc.nickname.replace(/'/g, "\\'");
+            const safeName = this.escapeHtml(JSON.stringify(acc.nickname));
+            const safeId = this.escapeHtml(JSON.stringify(acc.fakeid));
             return `
-            <div class="account-card" data-fakeid="${acc.fakeid}" style="cursor: pointer;" onclick="AccountsPage.openArticles('${acc.fakeid}', '${safeName}')">
+            <div class="account-card" data-fakeid="${this.escapeHtml(acc.fakeid)}" style="cursor: pointer;" onclick="AccountsPage.openArticles(${safeId}, ${safeName})">
                 ${acc.round_head_img
-                    ? `<img class="account-avatar" src="${acc.round_head_img}" alt="${acc.nickname}" onerror="this.style.display='none'; this.nextElementSibling.style.display='flex';">
-                       <div class="account-avatar-placeholder" style="display: none;">${acc.nickname.charAt(0)}</div>`
-                    : `<div class="account-avatar-placeholder">${acc.nickname.charAt(0)}</div>`
+                    ? `<img class="account-avatar" src="${this.escapeHtml(acc.round_head_img)}" alt="${this.escapeHtml(acc.nickname)}" onerror="this.style.display='none'; this.nextElementSibling.style.display='flex';">
+                       <div class="account-avatar-placeholder" style="display: none;">${this.escapeHtml(acc.nickname.charAt(0))}</div>`
+                    : `<div class="account-avatar-placeholder">${this.escapeHtml(acc.nickname.charAt(0))}</div>`
                 }
                 <div class="account-info">
-                    <div class="account-name">${acc.nickname}</div>
-                    <div class="account-id">${acc.alias ? '@' + acc.alias : ''} · ${acc.fakeid.substring(0, 10)}...</div>
-                    ${acc.signature ? `<div style="font-size: 0.78rem; color: var(--text-muted); margin-top: 2px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;">${acc.signature}</div>` : ''}
+                    <div class="account-name">${this.escapeHtml(acc.nickname)}</div>
+                    <div class="account-id">${this.escapeHtml(acc.alias ? '@' + acc.alias : '')} · ${acc.fakeid.substring(0, 10)}...</div>
+                    ${acc.signature ? `<div style="font-size: 0.78rem; color: var(--text-muted); margin-top: 2px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;">${this.escapeHtml(acc.signature)}</div>` : ''}
                 </div>
                 <div class="account-actions">
-                    <button class="btn btn-sm btn-primary" onclick="event.stopPropagation(); AccountsPage.openArticles('${acc.fakeid}', '${safeName}')">
+                    <button class="btn btn-sm btn-primary" onclick="event.stopPropagation(); AccountsPage.openArticles(${safeId}, ${safeName})">
                         📰 文章
                     </button>
-                    <button class="btn btn-sm" style="background: rgba(255, 152, 0, 0.12); color: #ff9800; border: 1px solid rgba(255, 152, 0, 0.25);" onclick="event.stopPropagation(); AccountsPage.showRssModal('${acc.fakeid}', '${safeName}')">
+                    <button class="btn btn-sm" style="background: rgba(255, 152, 0, 0.12); color: #ff9800; border: 1px solid rgba(255, 152, 0, 0.25);" onclick="event.stopPropagation(); AccountsPage.showRssModal(${safeId}, ${safeName})">
                         📡 RSS
                     </button>
-                    <button class="btn btn-sm btn-danger" onclick="event.stopPropagation(); AccountsPage.removeAccount('${acc.fakeid}', '${safeName}')">
+                    <button class="btn btn-sm backfill-btn" data-backfill-fakeid="${this.escapeHtml(acc.fakeid)}" title="向前回溯并归档该公众号的历史文章" onclick="event.stopPropagation(); AccountsPage.showBackfillModal(${safeId}, ${safeName})">
+                        🕘 获取历史<span class="backfill-badge" data-backfill-badge="${this.escapeHtml(acc.fakeid)}"></span>
+                    </button>
+                    <button class="btn btn-sm btn-danger" onclick="event.stopPropagation(); AccountsPage.removeAccount(${safeId}, ${safeName})">
                         🗑
                     </button>
                 </div>
             </div>
         `}).join('');
+        this.refreshBackfillBadges();
     },
 
     async search() {
@@ -347,6 +352,11 @@ const AccountsPage = {
                         <!-- Status Section -->
                         ${statusSection}
 
+                        <div style="margin-top: var(--spacing-sm); font-size: 0.8rem; color: var(--text-muted); display: flex; justify-content: space-between; align-items: center; gap: 8px;">
+                            <span>需要更早的文章？历史回溯与 RSS 订阅相互独立，未开启订阅也可使用。</span>
+                            <button class="btn btn-secondary btn-sm" id="rss-open-backfill-btn" style="padding: 3px 10px; font-size: 0.75rem; white-space: nowrap;">🕘 历史回溯</button>
+                        </div>
+
                         <hr style="border: 0; border-top: 1px solid var(--border-color); margin: var(--spacing-lg) 0;">
 
                         <!-- RSS Feed URL -->
@@ -375,6 +385,12 @@ const AccountsPage = {
 
             // Bind copy button
             overlay.querySelector('#rss-copy-btn').addEventListener('click', () => AccountsPage.copyRssUrl());
+
+            // 历史回溯快捷入口（与「上传历史文章」无关：那个按钮只负责把本地已下载文章上传到服务器）
+            overlay.querySelector('#rss-open-backfill-btn').addEventListener('click', () => {
+                overlay.remove();
+                AccountsPage.showBackfillModal(fakeid, nickname);
+            });
 
             // Bind switch change
             const checkbox = overlay.querySelector('#rss-enable-checkbox');
@@ -574,5 +590,312 @@ const AccountsPage = {
         if (pending > 0) return `${pending} 篇待上传`;
         if (sub?.last_upload_error) return '上次上传失败';
         return '✅ 已全部上传';
+    },
+
+    // ── 历史回溯（获取历史）──────────────────────────────
+
+    backfillPollTimer: null,
+    backfillBusy: false,
+
+    BACKFILL_STATE_LABELS: {
+        idle: '空闲',
+        queued: '已排队',
+        running: '执行中',
+        waiting_priority: '让路等待（更新任务优先）',
+        cooldown: '冷却中',
+        paused: '已暂停',
+        completed_batch: '本批已完成',
+        end_confirmed: '已确认历史终点',
+        failed: '失败',
+        cancelled: '已取消',
+    },
+
+    escapeHtml(text) {
+        return String(text ?? '').replace(/[&<>"']/g, ch => ({
+            '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;',
+        }[ch]));
+    },
+
+    formatBackfillTime(ts, withTime = true) {
+        if (!ts) return '—';
+        const d = new Date(ts * 1000);
+        return withTime ? d.toLocaleString() : d.toLocaleDateString();
+    },
+
+    /** 卡片上的小状态徽标：活跃任务 / 暂停 / 待下载数 */
+    async refreshBackfillBadges() {
+        try {
+            const data = await API.backfill.accounts();
+            (data.accounts || []).forEach(st => {
+                const badge = document.querySelector(`[data-backfill-badge="${CSS.escape(st.fakeid)}"]`);
+                if (!badge) return;
+                let text = '';
+                if (st.active_run) text = st.state === 'running' ? ' · 进行中' : ' · 排队';
+                else if (st.paused) text = ' · 已暂停';
+                else if (st.archived_count) text = ` · ${st.archived_count}`;
+                badge.textContent = text;
+            });
+        } catch (err) {
+            // 状态接口不可用时只是不显示徽标
+        }
+    },
+
+    describeBackfillProgress(st) {
+        const earliest = st.earliest_publish_time ? this.formatBackfillTime(st.earliest_publish_time, false) : '';
+        const head = `已扫描 ${st.scanned_count} 条` + (earliest ? `，最早已到 ${earliest}` : '');
+        if (st.end_confirmed) return `${head}，已确认到达可见历史终点（上游明确返回末页）`;
+        if (st.suspected_limit) return `${head}，疑似到达上游可见边界（连续空页），尚未确认历史终点`;
+        return `${head}，尚未确认历史终点`;
+    },
+
+    async showBackfillModal(fakeid, nickname) {
+        const existing = document.getElementById('backfill-modal-overlay');
+        if (existing) existing.remove();
+        this.stopBackfillPolling();
+
+        const overlay = document.createElement('div');
+        overlay.id = 'backfill-modal-overlay';
+        overlay.className = 'modal-overlay active';
+        overlay.innerHTML = `
+            <div class="modal-dialog" style="max-width: 600px;">
+                <div class="modal-header">
+                    <h3 class="modal-title">🕘 历史回溯 — ${this.escapeHtml(nickname)}</h3>
+                    <button class="modal-close" data-action="close">&times;</button>
+                </div>
+                <div class="modal-body" id="backfill-modal-body">
+                    <div style="padding: 24px; text-align: center;"><div class="spinner" style="margin: 0 auto;"></div></div>
+                </div>
+            </div>`;
+        document.body.appendChild(overlay);
+
+        const close = () => {
+            this.stopBackfillPolling();
+            overlay.remove();
+            this.refreshBackfillBadges();
+        };
+        overlay.addEventListener('click', (e) => {
+            if (e.target === overlay || e.target.closest('[data-action="close"]')) close();
+        });
+        overlay.addEventListener('click', (e) => {
+            const btn = e.target.closest('[data-bf-action]');
+            if (btn && !btn.disabled) this.handleBackfillAction(btn.dataset.bfAction, fakeid, nickname, btn);
+        });
+        overlay.addEventListener('change', (e) => {
+            if (e.target.id === 'backfill-auto-checkbox') {
+                this.handleBackfillAction('auto', fakeid, nickname, e.target);
+            }
+        });
+
+        await this.refreshBackfillModal(fakeid);
+        this.backfillPollTimer = setInterval(() => {
+            if (!document.getElementById('backfill-modal-overlay')) {
+                this.stopBackfillPolling();
+                return;
+            }
+            this.refreshBackfillModal(fakeid);
+        }, 5000);
+    },
+
+    stopBackfillPolling() {
+        if (this.backfillPollTimer) {
+            clearInterval(this.backfillPollTimer);
+            this.backfillPollTimer = null;
+        }
+    },
+
+    async refreshBackfillModal(fakeid) {
+        const body = document.getElementById('backfill-modal-body');
+        if (!body) return;
+        let st;
+        try {
+            st = await API.backfill.status(fakeid);
+        } catch (err) {
+            body.innerHTML = `<div style="padding: 16px; color: var(--error); text-align: center;">加载状态失败：${this.escapeHtml(err.message)}</div>`;
+            return;
+        }
+        // 定时刷新时保留用户正在操作的输入（批次条数、已展开的归档列表）
+        const scanSel = document.getElementById('backfill-scan-count');
+        const keepScan = scanSel ? scanSel.value : null;
+        const panel = document.getElementById('backfill-articles-panel');
+        const keepPanel = panel && panel.style.display !== 'none' ? panel.innerHTML : null;
+        body.innerHTML = this.renderBackfillBody(st);
+        if (keepScan) {
+            const sel = document.getElementById('backfill-scan-count');
+            if (sel) sel.value = keepScan;
+        }
+        if (keepPanel !== null) {
+            const p2 = document.getElementById('backfill-articles-panel');
+            if (p2) { p2.style.display = 'block'; p2.innerHTML = keepPanel; }
+        }
+    },
+
+    renderBackfillBody(st) {
+        const esc = (v) => this.escapeHtml(v);
+        const stateLabel = this.BACKFILL_STATE_LABELS[st.state] || st.state;
+        const active = st.active_run;
+        const busy = !!active;
+        const now = Date.now() / 1000;
+        const waitTs = (active && active.retry_at > now) ? active.retry_at : (st.next_eligible_at > now ? st.next_eligible_at : 0);
+        const stateColor = st.paused || st.state === 'failed' ? 'var(--error)'
+            : (busy ? 'var(--badge-warning-color)' : (st.end_confirmed ? 'var(--success, #4caf50)' : 'var(--text-primary)'));
+        const row = (label, value, extra = '') => `
+            <div style="display: flex; justify-content: space-between; gap: 12px; margin-bottom: 6px;">
+                <span style="color: var(--text-muted); white-space: nowrap;">${label}</span>
+                <span style="text-align: right; ${extra}">${value}</span>
+            </div>`;
+
+        let hint = '';
+        if (st.paused) {
+            hint = st.pause_reason === 'captcha_required'
+                ? '⚠️ 遇到腾讯防水墙验证码已自动暂停。请在微信读书 App 中打开任意公众号文章完成验证（或在页面弹出的滑块中验证）后，点击「继续」。'
+                : '⏸ 已暂停：不会发起任何历史请求，点击「继续」后按原断点恢复。';
+        } else if (active && active.state !== 'running' && active.state !== 'queued') {
+            hint = `⏳ 已排队／冷却中：${esc(active.message || st.reason_message || active.reason)}` +
+                (waitTs ? `，预计 ${this.formatBackfillTime(waitTs)} 后可继续` : '');
+        } else if (active && active.state === 'queued') {
+            hint = '⏳ 已排队，将在空闲时执行（遵守请求间隔、账号冷却与 RSS 更新优先级）。';
+        } else if (active && active.state === 'running') {
+            hint = '🔄 正在执行本批次：扫描历史章节并下载正文…';
+        } else if (st.state === 'failed' && st.last_error) {
+            hint = `❌ 上一批失败：${esc(st.last_error)}`;
+        }
+
+        const runs = (st.recent_runs || []).map(r => {
+            const label = this.BACKFILL_STATE_LABELS[r.state] || r.state;
+            const trig = r.trigger === 'manual' ? '手动' : '自动';
+            const detail = r.message || r.reason || '';
+            return `<div style="display: flex; justify-content: space-between; gap: 8px; padding: 4px 0; border-bottom: 1px dashed var(--border-color); font-size: 0.76rem;">
+                <span style="color: var(--text-muted); white-space: nowrap;">${this.formatBackfillTime(r.created_at)} · ${trig}</span>
+                <span style="text-align: right;">${esc(label)}${detail ? ` · ${esc(detail)}` : ''}</span>
+            </div>`;
+        }).join('') || '<div style="color: var(--text-muted); text-align: center; padding: 6px; font-size: 0.78rem;">暂无运行记录</div>';
+
+        const dis = (cond) => cond ? 'disabled' : '';
+        const quota = st.daily || { used: 0, limit: 0 };
+
+        return `
+            <div style="padding: var(--spacing-sm) var(--spacing-md); background: var(--bg-glass); border-radius: var(--radius-md); border: 1px solid var(--border-color); font-size: 0.82rem;">
+                ${row('当前状态：', esc(stateLabel), `font-weight: 600; color: ${stateColor};`)}
+                ${row('回溯进度：', esc(this.describeBackfillProgress(st)))}
+                ${row('已发现 / 已归档：', `${st.archived_count} 篇 / 已下载 ${st.downloaded_count} 篇`)}
+                ${row('待下载：', `${st.pending_count} 篇`)}
+                ${row('下载失败：', `${st.failed_count} 篇${st.permanent_failed_count ? `（另有 ${st.permanent_failed_count} 篇已删除/屏蔽）` : ''}`, st.failed_count ? 'color: var(--error);' : '')}
+                ${row('最早历史文章：', st.earliest_publish_time ? this.formatBackfillTime(st.earliest_publish_time, false) : '—')}
+                ${row('今日已用额度：', `${quota.used} / ${quota.limit} 篇`)}
+                ${row('下次可执行：', st.next_eligible_at > now ? this.formatBackfillTime(st.next_eligible_at) : '随时')}
+                ${row('RSS 订阅：', st.rss_subscribed ? '已开启' : '未开启（不影响历史回溯）')}
+                ${st.last_error && !st.paused ? row('最近错误：', esc(st.last_error), 'color: var(--error); word-break: break-all; max-width: 65%;') : ''}
+            </div>
+            ${hint ? `<div style="margin-top: var(--spacing-sm); font-size: 0.8rem; padding: 8px 10px; border-radius: var(--radius-md); background: rgba(255, 152, 0, 0.08); border: 1px solid rgba(255, 152, 0, 0.25);">${hint}</div>` : ''}
+
+            <div style="display: flex; gap: 8px; align-items: center; margin-top: var(--spacing-md); flex-wrap: wrap;">
+                <label style="font-size: 0.82rem; color: var(--text-muted);" for="backfill-scan-count">本批扫描条数</label>
+                <select class="form-input" id="backfill-scan-count" style="width: 90px;">
+                    ${[5, 10, 20, 30].map(n => `<option value="${n}" ${n === 10 ? 'selected' : ''}>${n}</option>`).join('')}
+                </select>
+                <button class="btn btn-primary" data-bf-action="run" ${dis(busy || st.paused || this.backfillBusy)}>
+                    ${busy ? '⏳ 已有任务进行中' : '▶ 立即获取一批'}
+                </button>
+            </div>
+            <div class="form-hint" style="margin-top: 6px;">每次只提交一个有界批次（扫描 ≤ 所选条数并下载对应正文），异步执行、不会长时间占用页面；遵守系统请求间隔、账号冷却与 RSS 更新优先级。上游历史总量未知，因此不显示百分比。</div>
+
+            <div class="switch-group" style="margin-top: var(--spacing-md);">
+                <div class="switch-label">
+                    <span class="label-title">空闲自动回溯</span>
+                    <span class="label-desc">${st.global_auto_enabled ? '开启后在系统空闲时按小批次自动向更早推进' : '全局开关当前关闭（系统设置 → 历史回溯），开启此项后仍需打开全局开关才会自动执行'}</span>
+                </div>
+                <label class="switch">
+                    <input type="checkbox" id="backfill-auto-checkbox" ${st.auto_enabled ? 'checked' : ''}>
+                    <span class="switch-slider"></span>
+                </label>
+            </div>
+
+            <div style="display: flex; gap: 8px; justify-content: flex-end; flex-wrap: wrap; margin-top: var(--spacing-md);">
+                ${st.paused
+                    ? `<button class="btn btn-sm btn-success" data-bf-action="resume">▶ 继续</button>`
+                    : `<button class="btn btn-sm btn-secondary" data-bf-action="pause">⏸ 暂停</button>`}
+                <button class="btn btn-sm btn-secondary" data-bf-action="retry" ${dis(!st.failed_count)}>🔁 失败重试${st.failed_count ? `（${st.failed_count}）` : ''}</button>
+                <button class="btn btn-sm btn-secondary" data-bf-action="articles">📄 已归档列表</button>
+                <button class="btn btn-sm btn-danger" data-bf-action="reset" ${dis(active && active.state === 'running')}>↺ 重置扫描位置</button>
+            </div>
+
+            <div id="backfill-articles-panel" style="display: none; margin-top: 10px; max-height: 220px; overflow-y: auto; border-top: 1px solid var(--border-color); padding-top: 6px;"></div>
+
+            <div style="margin-top: var(--spacing-md); font-size: 0.82rem; font-weight: 500;">最近任务</div>
+            <div style="max-height: 160px; overflow-y: auto; margin-top: 4px;">${runs}</div>
+        `;
+    },
+
+    async handleBackfillAction(action, fakeid, nickname, el) {
+        if (this.backfillBusy && action !== 'articles') return;
+        const refresh = () => this.refreshBackfillModal(fakeid);
+        const lock = async (fn) => {
+            this.backfillBusy = true;
+            if (el && el.tagName === 'BUTTON') el.disabled = true;
+            try { await fn(); } finally { this.backfillBusy = false; await refresh(); }
+        };
+
+        if (action === 'run') {
+            const scan = parseInt(document.getElementById('backfill-scan-count')?.value || '10', 10);
+            await lock(async () => {
+                try {
+                    const res = await API.backfill.runOnce(fakeid, scan);
+                    if (res.state === 'queued' || res.state === 'running') {
+                        Toast.show(res.message, res.duplicate ? 'info' : 'success');
+                    } else {
+                        // 命中冷却 / 让路：如实显示为排队，而不是「执行成功」
+                        Toast.warning(res.message);
+                    }
+                } catch (err) {
+                    Toast.warning(err.message || '提交失败');
+                }
+            });
+        } else if (action === 'pause') {
+            await lock(async () => {
+                try { Toast.success((await API.backfill.pause(fakeid)).message); } catch (err) { /* shown by API */ }
+            });
+        } else if (action === 'resume') {
+            await lock(async () => {
+                try { Toast.success((await API.backfill.resume(fakeid)).message); } catch (err) { /* shown by API */ }
+            });
+        } else if (action === 'retry') {
+            await lock(async () => {
+                try { Toast.success((await API.backfill.retryFailed(fakeid)).message); } catch (err) { /* shown by API */ }
+            });
+        } else if (action === 'auto') {
+            const checked = !!el.checked;
+            await lock(async () => {
+                try {
+                    const res = await API.backfill.setAuto(fakeid, checked);
+                    Toast.show(res.message, res.global_auto_enabled || !checked ? 'success' : 'warning');
+                } catch (err) {
+                    el.checked = !checked;
+                }
+            });
+        } else if (action === 'reset') {
+            Modal.confirm('重置扫描位置',
+                `确定要把「${this.escapeHtml(nickname)}」的历史扫描位置重置到最新处吗？<br>已归档文章、本地文件与待下载队列都会保留，只是下一批将从最新文章重新向前扫描（已归档的文章会被去重跳过）。`,
+                () => lock(async () => {
+                    try { Toast.success((await API.backfill.resetCursor(fakeid)).message); } catch (err) { /* shown by API */ }
+                }));
+        } else if (action === 'articles') {
+            const panel = document.getElementById('backfill-articles-panel');
+            if (!panel) return;
+            if (panel.style.display !== 'none') { panel.style.display = 'none'; return; }
+            panel.style.display = 'block';
+            panel.innerHTML = '<div style="color: var(--text-muted); text-align: center; padding: 8px;">加载中...</div>';
+            try {
+                const res = await API.backfill.articles(fakeid, 100, 0);
+                const statusText = { discovered: '已发现', pending: '待下载', downloaded: '已下载', failed: '失败', permanent_failed: '不可下载' };
+                panel.innerHTML = (res.articles || []).map(a => `
+                    <div style="display: flex; justify-content: space-between; gap: 8px; padding: 3px 0; border-bottom: 1px dashed var(--border-color); font-size: 0.76rem;">
+                        <span style="overflow: hidden; text-overflow: ellipsis; white-space: nowrap;" title="${this.escapeHtml(a.title)}">${this.formatBackfillTime(a.publish_time, false)} · ${this.escapeHtml(a.title || '(无标题)')}</span>
+                        <span style="white-space: nowrap; color: ${a.download_status === 'downloaded' ? 'var(--success, #4caf50)' : 'var(--text-muted)'};">${statusText[a.download_status] || a.download_status}</span>
+                    </div>`).join('') + `<div style="color: var(--text-muted); font-size: 0.74rem; padding-top: 4px;">共 ${res.total} 篇${res.total > 100 ? '（仅显示最近 100 篇）' : ''}</div>`;
+                if (!res.total) panel.innerHTML = '<div style="color: var(--text-muted); text-align: center; padding: 8px;">尚未归档任何文章</div>';
+            } catch (err) {
+                panel.innerHTML = '<div style="color: var(--error); text-align: center; padding: 8px;">加载失败</div>';
+            }
+        }
     },
 };

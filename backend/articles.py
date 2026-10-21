@@ -7,6 +7,7 @@ import os
 import sys
 import subprocess
 import json
+import logging
 import time
 import re
 import urllib.parse
@@ -21,17 +22,35 @@ from backend.config import (
     CONFIG_FILE, BASE_URL, DEFAULT_HEADERS, OUTPUT_DIR, DATA_DIR,
     DOWNLOAD_HISTORY_FILE,
     load_json, save_json, get_settings, get_proxies_dict, report_proxy_status,
-    normalize_wechat_url, get_default_wechat_ua
+    normalize_wechat_url, get_default_wechat_ua,
+    append_download_history, update_download_history,
 )
 from backend.account_pool import borrow_session, borrow_weread_session, account_pool, get_weread_session
 from backend.accounts import biz_to_book_id
 from backend.runtime import desktop_available, host_path_hint
+
+logger = logging.getLogger(__name__)
 
 articles_bp = Blueprint("articles", __name__, url_prefix="/api/articles")
 
 # 下载进度管理
 _download_tasks = {}
 _download_lock = threading.Lock()
+
+
+def _run_as_foreground(name: str, target, *args):
+    """在请求协调器中登记为前台任务后执行：历史回溯会在其运行期间待机"""
+    from backend.request_coordinator import request_coordinator
+
+    with request_coordinator.foreground(name):
+        target(*args)
+
+
+def _register_archive(account_name: str, article: dict, result: dict):
+    """把手动下载结果登记到持久化文章索引"""
+    from backend.history_backfill import record_external_download
+
+    record_external_download(account_name, article, result or {}, source="manual")
 
 
 def _get_session():
@@ -309,10 +328,13 @@ def get_articles(fakeid):
     t_start = time.time()
     print(f"[Articles API] Start fetching articles for fakeid={fakeid} begin={begin} count={count} from_article_id={from_article_id}", flush=True)
 
+    from backend.request_coordinator import request_coordinator
+
     try:
-        articles, total_count, can_continue = _fetch_articles_page(
-            fakeid, begin, count, keyword, account_name=keyword, from_article_id=from_article_id
-        )
+        with request_coordinator.foreground("articles_list"):
+            articles, total_count, can_continue = _fetch_articles_page(
+                fakeid, begin, count, keyword, account_name=keyword, from_article_id=from_article_id
+            )
         print(f"[Articles API] Fetch finished in {time.time() - t_start:.2f}s, got {len(articles)} articles", flush=True)
 
         from backend.waterwall import is_waterwall_active, waterwall_snapshot
@@ -406,8 +428,8 @@ def start_download():
         }
 
     thread = threading.Thread(
-        target=_do_batch_download,
-        args=(task_id, articles, account_name),
+        target=_run_as_foreground,
+        args=("manual_download", _do_batch_download, task_id, articles, account_name),
         daemon=True,
     )
     thread.start()
@@ -450,8 +472,9 @@ def start_range_download():
         }
 
     thread = threading.Thread(
-        target=_do_range_download,
-        args=(task_id, fakeid, account_name, start_time, end_time, keyword, page_size),
+        target=_run_as_foreground,
+        args=("manual_download", _do_range_download, task_id, fakeid, account_name, start_time, end_time,
+              keyword, page_size),
         daemon=True,
     )
     thread.start()
@@ -561,8 +584,8 @@ def download_by_url():
         }
 
     thread = threading.Thread(
-        target=_do_batch_download,
-        args=(task_id, articles, "url_download"),
+        target=_run_as_foreground,
+        args=("manual_download", _do_batch_download, task_id, articles, "url_download"),
         daemon=True,
     )
     thread.start()
@@ -726,41 +749,60 @@ def _resolve_history_path(raw_path: str, download_dir: str) -> str:
     return raw_path
 
 
+def _is_reader_item(item: dict) -> bool:
+    """阅读视图：成功且有落盘路径，或永久性失败（作者删除 / 屏蔽 / 链接过期）的条目"""
+    if item.get("success") and item.get("path"):
+        return True
+    err = str(item.get("error") or "")
+    return (not item.get("success")) and any(k in err for k in ("删除", "屏蔽", "过期"))
+
+
 @articles_bp.route("/history", methods=["GET"])
 def get_history():
-    """获取下载历史"""
-    history = load_json(DOWNLOAD_HISTORY_FILE, [])
-    
-    # 自动从磁盘同步丢失的历史记录
-    if _sync_history_from_disk(history):
-        save_json(DOWNLOAD_HISTORY_FILE, history)
+    """获取下载历史（服务端分页）
 
-    download_dir = get_settings().get("download_dir") or str(OUTPUT_DIR)
+    参数（均可选，默认行为与旧版一致）：
+      limit   返回条数，默认 50；<= 0 表示全部
+      offset  跳过条数，默认 0
+      account 只看某个公众号
+      view    reader = 仅成功落盘 / 永久失败的条目（下载历史阅读页使用）
+      sort    publish = 按发布时间倒序；默认按下载时间倒序
+    """
+    offset = max(0, request.args.get("offset", 0, type=int) or 0)
+    account_filter = (request.args.get("account") or "").strip()
+    view = (request.args.get("view") or "").strip()
+    sort_key = (request.args.get("sort") or "").strip()
 
-    indexed_history = []
-    for index, item in enumerate(history):
-        if isinstance(item, dict):
-            if item.get("account") == "微信视频号":
-                continue
-            indexed = dict(item)
-            if not indexed.get("account") and indexed.get("account_name"):
-                indexed["account"] = indexed["account_name"]
-            indexed["_index"] = index
-            if indexed.get("path"):
-                # 旧机器的绝对路径重定位到当前下载目录；界面上再显示宿主机路径
-                indexed["path"] = _resolve_history_path(indexed["path"], download_dir)
-                indexed["display_path"] = host_path_hint(indexed["path"])
-            indexed_history.append(indexed)
-    indexed_history.sort(key=lambda x: x.get("time", 0), reverse=True)
-    # 限制返回数量
+    from backend.backfill_store import get_store
+    store = get_store()
+    if request.args.get("sync") == "1":
+        update_download_history(lambda history: bool(_sync_history_from_disk(history)))
+    store.sync_history_file()
     limit = request.args.get("limit", 50, type=int)
-    sliced_history = indexed_history if limit <= 0 else indexed_history[:limit]
-    return jsonify({"history": sliced_history, "total": len(indexed_history)})
+    rows, total, accounts = store.history_page(
+        account=account_filter, reader=view == "reader", publish=sort_key == "publish",
+        limit=limit, offset=offset)
+    download_dir = get_settings().get("download_dir") or str(OUTPUT_DIR)
+    for row in rows:
+        row.setdefault("account", row.get("account_name", ""))
+        if row.get("path"):
+            row["path"] = _resolve_history_path(row["path"], download_dir)
+            row["display_path"] = host_path_hint(row["path"])
+    return jsonify({"history": rows, "total": total, "offset": offset,
+                    "has_more": limit > 0 and offset + len(rows) < total, "accounts": accounts})
 
 
 @articles_bp.route("/history", methods=["DELETE"])
 def clear_history():
     """清空下载历史，并删除对应的本地下载文件/目录"""
+    from backend.config import DOWNLOAD_HISTORY_LOCK
+
+    with DOWNLOAD_HISTORY_LOCK:
+        deleted_dirs_count = _clear_history_locked()
+    return _clear_history_response(deleted_dirs_count)
+
+
+def _clear_history_locked() -> int:
     history = load_json(DOWNLOAD_HISTORY_FILE, [])
     deleted_dirs_count = 0
     remaining_history = []
@@ -788,7 +830,22 @@ def clear_history():
                 pass
 
     save_json(DOWNLOAD_HISTORY_FILE, remaining_history)
+    _forget_archive_paths([it.get("path") for it in history
+                           if isinstance(it, dict) and it.get("account") != "微信视频号"])
+    return deleted_dirs_count
 
+
+def _forget_archive_paths(paths):
+    """下载文件被用户删除后，同步让归档索引不再指向这些目录（失败不影响删除本身）"""
+    try:
+        from backend.backfill_store import get_store
+
+        get_store().forget_local_paths(paths)
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("同步归档索引失败: %s", exc)
+
+
+def _clear_history_response(deleted_dirs_count: int):
     # 自动清理空出来的公众号目录
     try:
         settings = get_settings()
@@ -810,6 +867,13 @@ def clear_history():
 @articles_bp.route("/history/<int:index>", methods=["DELETE"])
 def delete_history_item(index):
     """删除单条下载历史，并删除对应下载文件夹。"""
+    from backend.config import DOWNLOAD_HISTORY_LOCK
+
+    with DOWNLOAD_HISTORY_LOCK:
+        return _delete_history_item_locked(index)
+
+
+def _delete_history_item_locked(index):
     history = load_json(DOWNLOAD_HISTORY_FILE, [])
     if index < 0 or index >= len(history):
         return jsonify({"error": "历史记录不存在"}), 404
@@ -834,6 +898,8 @@ def delete_history_item(index):
 
     history.pop(index)
     save_json(DOWNLOAD_HISTORY_FILE, history)
+    if path_str and file_status in ("deleted", "missing"):
+        _forget_archive_paths([path_str])
 
     messages = {
         "deleted": "已删除下载文件和记录",
@@ -856,7 +922,12 @@ def _do_batch_download(task_id: str, articles: list, account_name: str):
     out_dir = download_dir / account_name
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    history = load_json(DOWNLOAD_HISTORY_FILE, [])
+    # 只收集本轮新增的历史记录，结束时在共享锁内追加（不再「开头读一次、结尾整体写回」覆盖其他线程）
+    history = []
+
+    def flush_history():
+        append_download_history(history)
+        history.clear()
 
     try:
         for i, article in enumerate(articles):
@@ -867,7 +938,7 @@ def _do_batch_download(task_id: str, articles: list, account_name: str):
                     task["current"] = ""
                     task["end_time"] = time.time()
                     task["stop_reason"] = task.get("stop_reason") or "用户请求停止"
-                    save_json(DOWNLOAD_HISTORY_FILE, history)
+                    flush_history()
                     return
 
             link = article.get("link", "")
@@ -938,13 +1009,14 @@ def _do_batch_download(task_id: str, articles: list, account_name: str):
                 "has_markdown": result.get("has_markdown", False),
                 "has_pdf": result.get("has_pdf", False),
             })
+            _register_archive(real_account, article, {**result, "title": title, "success": success})
 
             if i < len(articles) - 1:
                 import random
                 time.sleep(max(1.0, delay) + random.uniform(0.3, 1.2))
 
         # 保存历史
-        save_json(DOWNLOAD_HISTORY_FILE, history)
+        flush_history()
 
         with _download_lock:
             task = _download_tasks[task_id]
@@ -957,7 +1029,7 @@ def _do_batch_download(task_id: str, articles: list, account_name: str):
             task["end_time"] = time.time()
     except Exception as e:
         print(f"[_do_batch_download] 异常: {e}", flush=True)
-        save_json(DOWNLOAD_HISTORY_FILE, history)
+        flush_history()
         with _download_lock:
             task = _download_tasks.get(task_id, {})
             task["status"] = "failed"
@@ -1035,6 +1107,7 @@ def _download_article_into_task(task_id: str, article: dict, account_name: str, 
         "has_markdown": result.get("has_markdown", False),
         "has_pdf": result.get("has_pdf", False),
     })
+    _register_archive(account_name, article, {**result, "title": title, "success": success})
 
 
 def _do_range_download(
@@ -1049,7 +1122,12 @@ def _do_range_download(
     """分页拉取文章，下载时间范围内文章，遇到更早文章后停止。"""
     settings = get_settings()
     delay = settings.get("request_delay", 0.8)
-    history = load_json(DOWNLOAD_HISTORY_FILE, [])
+    history = []
+
+    def flush_history():
+        append_download_history(history)
+        history.clear()
+
     begin = 0
     downloaded_index = 0
     stop = False
@@ -1063,7 +1141,7 @@ def _do_range_download(
                     task["current"] = ""
                     task["end_time"] = time.time()
                     task["stop_reason"] = task.get("stop_reason") or "用户请求停止"
-                    save_json(DOWNLOAD_HISTORY_FILE, history)
+                    flush_history()
                     return
                 task["current"] = f"正在获取第 {begin // page_size + 1} 页"
 
@@ -1096,7 +1174,7 @@ def _do_range_download(
                         task["current"] = ""
                         task["end_time"] = time.time()
                         task["stop_reason"] = task.get("stop_reason") or "用户请求停止"
-                        save_json(DOWNLOAD_HISTORY_FILE, history)
+                        flush_history()
                         return
                     task["total"] += 1
 
@@ -1119,7 +1197,7 @@ def _do_range_download(
                     _download_tasks[task_id]["stop_reason"] = "已扫描全部文章"
                 break
 
-        save_json(DOWNLOAD_HISTORY_FILE, history)
+        flush_history()
         with _download_lock:
             task = _download_tasks[task_id]
             if task["status"] not in ("cancelled",):
@@ -1128,7 +1206,7 @@ def _do_range_download(
             task["end_time"] = time.time()
 
     except PermissionError as e:
-        save_json(DOWNLOAD_HISTORY_FILE, history)
+        flush_history()
         with _download_lock:
             task = _download_tasks[task_id]
             task["status"] = "failed"
@@ -1136,7 +1214,7 @@ def _do_range_download(
             task["stop_reason"] = str(e)
             task["end_time"] = time.time()
     except Exception as e:
-        save_json(DOWNLOAD_HISTORY_FILE, history)
+        flush_history()
         with _download_lock:
             task = _download_tasks[task_id]
             task["status"] = "failed"

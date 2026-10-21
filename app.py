@@ -10,6 +10,8 @@ Flask 后端 + Web 前端
 
 import os
 import sys
+import atexit
+import signal
 
 def ensure_virtualenv():
     """检测当前是否运行在虚拟环境 venv312 中。
@@ -64,6 +66,7 @@ from backend.bilibili import bilibili_bp
 from backend.bilibili_login import bilibili_login_bp
 from backend.updater import updater_bp
 from backend.waterwall import waterwall_bp
+from backend.history_backfill_api import backfill_bp
 
 # ── Flask 应用 ────────────────────────────────────────────
 static_folder_path = resource_dir() / "frontend"
@@ -94,6 +97,7 @@ app.register_blueprint(bilibili_bp)
 app.register_blueprint(bilibili_login_bp)
 app.register_blueprint(updater_bp)
 app.register_blueprint(waterwall_bp)
+app.register_blueprint(backfill_bp)
 
 
 # 账号池旧数据迁移
@@ -103,6 +107,14 @@ migrate_legacy_config()
 # 启动 RSS 自动抓取调度器
 from backend.rss_scheduler import rss_scheduler
 rss_scheduler.start()
+
+# 启动历史回溯（单实例：进程内单例 + data/backfill.db 租约；失败不影响主程序）
+try:
+    from backend.history_backfill import backfill_scheduler
+    backfill_scheduler.start()
+    atexit.register(backfill_scheduler.stop)
+except Exception as _exc:  # noqa: BLE001
+    print(f"[warn] 历史回溯调度器启动失败：{_exc}", flush=True)
 
 
 
@@ -174,6 +186,7 @@ def open_browser(port: int):
 
 
 def main():
+    signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
     parser = argparse.ArgumentParser(description="微信公众号文章下载管理工具")
     parser.add_argument("--port", type=int, default=5200, help="服务端口 (默认 5200)")
     parser.add_argument("--host", type=str, default="127.0.0.1", help="监听地址")

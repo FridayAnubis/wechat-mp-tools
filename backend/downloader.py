@@ -22,6 +22,7 @@ from backend.config import (
     DEFAULT_HEADERS, get_proxies_dict, get_settings, report_proxy_status
 )
 from backend.avatar_cache import extract_account_avatar
+from backend.request_coordinator import coordinated_get, in_backfill_network
 
 logger = logging.getLogger(__name__)
 
@@ -571,7 +572,7 @@ def download_resource(url: str, path: Path) -> bool:
         proxies = get_proxies_dict()
         if proxies:
             proxy_url = proxies.get("http")
-        r = requests.get(
+        r = coordinated_get(
             url,
             headers={
                 "Referer": "https://mp.weixin.qq.com/",
@@ -966,7 +967,7 @@ def fetch_wechat_article_html(url: str, review_id: str = "") -> tuple[str, str, 
 
     for target_url in urls_to_try:
         try:
-            resp = requests.get(
+            resp = coordinated_get(
                 target_url,
                 headers=headers,
                 proxies=proxies,
@@ -1003,6 +1004,9 @@ def fetch_wechat_article_html(url: str, review_id: str = "") -> tuple[str, str, 
         if ok:
             return html, clean_orig_url, ""
 
+    if in_backfill_network():
+        return "", clean_orig_url, http_error or "正文暂不可用"
+
     # 无头浏览器渲染兜底
     chosen_url = clean_short_url or clean_orig_url
     logger.info(f"[Fetcher] HTTP 请求受限 ({http_error})，启用无头浏览器仿真兜底: {chosen_url}")
@@ -1011,6 +1015,22 @@ def fetch_wechat_article_html(url: str, review_id: str = "") -> tuple[str, str, 
         return browser_html, chosen_url, ""
 
     return "", clean_orig_url, http_error or browser_error or "抓取文章失败"
+
+
+def _discard_incomplete_dir(art_dir: Path):
+    """清理失败下载遗留的目录。
+
+    art_dir 由标题推导，同名文章（周报、早报等）会指向一篇已经成功归档的旧文章目录；
+    只有目录里没有任何离线 HTML 时才视为残留并删除，避免一次失败误删已归档的同名文章。
+    """
+    try:
+        if not art_dir.exists():
+            return
+        if any(f for f in art_dir.glob("*.html") if f.is_file()):
+            return
+        shutil.rmtree(art_dir, ignore_errors=True)
+    except OSError:
+        pass
 
 
 def download_single_article(url: str, out_dir: Path, title_hint: str = "", _redirect_depth: int = 0, review_id: str = "") -> dict:
@@ -1041,8 +1061,7 @@ def download_single_article(url: str, out_dir: Path, title_hint: str = "", _redi
 
     raw_html, final_url, fetch_error = fetch_wechat_article_html(clean_url, review_id=review_id)
     if not raw_html:
-        if art_dir.exists():
-            shutil.rmtree(art_dir, ignore_errors=True)
+        _discard_incomplete_dir(art_dir)
         return {"success": False, "title": safe_title, "error": fetch_error or "获取页面失败", "is_permanent": False}
 
     # 检测是否为微信屏蔽、删除或出错页面（贴图画廊类型可能不含 js_content/js_article，但含有 picture_page_info_list）
@@ -1092,8 +1111,7 @@ def download_single_article(url: str, out_dir: Path, title_hint: str = "", _redi
             is_permanent = False
 
     if is_error:
-        if art_dir.exists():
-            shutil.rmtree(art_dir, ignore_errors=True)
+        _discard_incomplete_dir(art_dir)
         report_proxy_status(proxy_url, success=False)
         return {"success": False, "title": safe_title, "error": error_msg, "is_permanent": is_permanent}
 
@@ -1107,8 +1125,7 @@ def download_single_article(url: str, out_dir: Path, title_hint: str = "", _redi
         if content_is_empty and _redirect_depth < MAX_REDIRECT_DEPTH:
             original_url = unescape(share_source_match.group(1))
             original_url = clean_wechat_article_url(original_url)
-            if art_dir.exists():
-                shutil.rmtree(art_dir, ignore_errors=True)
+            _discard_incomplete_dir(art_dir)
             return download_single_article(original_url, out_dir, title_hint, _redirect_depth=_redirect_depth + 1)
 
     # 提取封面 URL、描述和发布时间

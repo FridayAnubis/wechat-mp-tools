@@ -12,6 +12,10 @@ const API = {
             method,
             headers: { 'Content-Type': 'application/json' },
         };
+        const adminToken = sessionStorage.getItem('backfillAdminToken');
+        if (adminToken && (url.startsWith('/api/backfill/') || url === '/api/settings')) {
+            fetchOptions.headers['X-Admin-Token'] = adminToken;
+        }
 
         if (body) {
             fetchOptions.body = JSON.stringify(body);
@@ -128,8 +132,9 @@ const API = {
         downloadStatus(taskId) {
             return API.get(`/api/articles/download-status/${taskId}`, { showError: false });
         },
-        history(limit = 50) {
-            return API.get(`/api/articles/history?limit=${limit}`);
+        history(limit = 50, params = {}) {
+            const qs = new URLSearchParams({ limit, ...params });
+            return API.get(`/api/articles/history?${qs.toString()}`);
         },
         clearHistory() {
             return API.delete('/api/articles/history');
@@ -140,6 +145,30 @@ const API = {
         openFolder(account = '') { return API.post('/api/articles/open-folder', { account }); },
         openFile(path, type = null) { return API.post('/api/articles/open-file', { path, type }); },
         openParent(path) { return API.post('/api/articles/open-parent', { path }); },
+    },
+
+    // ── History Backfill API（公众号历史文章回溯）────────
+    backfill: {
+        _p(fakeid) { return `/api/backfill/${encodeURIComponent(fakeid)}`; },
+        accounts()                 { return API.get('/api/backfill/accounts', { showError: false }); },
+        status(fakeid)             { return API.get(`${this._p(fakeid)}/status`, { showError: false }); },
+        articles(fakeid, limit = 50, offset = 0, status = '') {
+            const qs = new URLSearchParams({ limit, offset });
+            if (status) qs.set('status', status);
+            return API.get(`${this._p(fakeid)}/articles?${qs.toString()}`);
+        },
+        runOnce(fakeid, scanCount) {
+            return API.post(`${this._p(fakeid)}/run-once`, scanCount ? { scan_count: scanCount } : {}, { showError: false });
+        },
+        pause(fakeid)              { return API.post(`${this._p(fakeid)}/pause`, {}); },
+        resume(fakeid)             { return API.post(`${this._p(fakeid)}/resume`, {}); },
+        setAuto(fakeid, enabled)   { return API.post(`${this._p(fakeid)}/auto`, { enabled: !!enabled }); },
+        retryFailed(fakeid, includePermanent = false) {
+            return API.post(`${this._p(fakeid)}/retry-failed`, { include_permanent: !!includePermanent });
+        },
+        resetCursor(fakeid)        { return API.post(`${this._p(fakeid)}/reset-cursor`, { confirm: true }); },
+        getSettings()              { return API.get('/api/backfill/settings', { showError: false }); },
+        saveSettings(settings)     { return API.put('/api/backfill/settings', settings); },
     },
 
     // ── Proxy API ────────────────────────────────────

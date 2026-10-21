@@ -105,7 +105,6 @@ class AccountPool:
     def _try_find_local_session(self) -> dict | None:
         """尝试读取用户本地破甲一键通 weread_web 的 session 文件快速导入"""
         candidate_paths = [
-            Path("/Users/apple/Downloads/破甲一键通-v7.5/weread_web/.session.json"),
             DATA_DIR / ".session.json",
         ]
         for p in candidate_paths:
@@ -141,10 +140,21 @@ class AccountPool:
 
     # ── 调度 ──────────────────────────────────────────
 
-    def acquire(self) -> dict | None:
+    @staticmethod
+    def _strictly_usable(acc: dict, now: float) -> bool:
+        """严格可用：状态 active、冷却已结束、额度充足。"""
+        return (
+            acc.get("status") == "active"
+            and float(acc.get("cooldown_until") or 0) <= now
+            and bool(acc.get("accessToken") or acc.get("token"))
+        )
+
+    def acquire(self, strict: bool = False) -> dict | None:
         """
         选出一个可用微信读书账号并返回其副本。
         支持冷却自愈与自动静默刷新。
+
+        strict=True 供低优先级的历史回溯使用：只返回严格可用的账号
         """
         now = time.time()
         with self._lock:
@@ -156,6 +166,18 @@ class AccountPool:
                     acc["status"] = "active"
                     acc["cooldown_until"] = 0
                     changed = True
+
+            if strict:
+                usable = [a for a in accounts if self._strictly_usable(a, now)]
+                if not usable:
+                    if changed:
+                        self._save(accounts)
+                    return None
+                usable.sort(key=lambda a: (a.get("failures", 0), a.get("last_used", 0)))
+                selected = usable[0]
+                selected["last_used"] = now
+                self._save(accounts)
+                return dict(selected)
 
             active = [a for a in accounts if a.get("status") == "active"]
             if not active:
@@ -196,14 +218,41 @@ class AccountPool:
         """所有微信读书账号对各公众号均为通用读取，直接调用 acquire()"""
         return self.acquire()
 
+    def strict_availability(self) -> dict:
+        """只读探测：当前是否存在strict可用账号；没有时给出最早可能恢复的时间。
+        """
+        now = time.time()
+        with self._lock:
+            accounts = self._load()
+        if not accounts:
+            return {"available": False, "reason": "no_account", "next_available_at": None}
+        if any(
+            (a.get("status") in ("active", "cooldown"))
+            and float(a.get("cooldown_until") or 0) <= now
+            and (a.get("accessToken") or a.get("token"))
+            for a in accounts
+        ):
+            return {"available": True, "reason": "", "next_available_at": None}
+        cooling = [float(a.get("cooldown_until") or 0) for a in accounts
+                   if a.get("status") == "cooldown" and float(a.get("cooldown_until") or 0) > now]
+        if cooling:
+            return {"available": False, "reason": "account_cooldown", "next_available_at": min(cooling)}
+        return {"available": False, "reason": "no_valid_account", "next_available_at": None}
+
     # ── 状态上报与熔断 ────────────────────────────────
 
     def report(self, account_id: str, *, ret: int | None = None,
                status_code: int | None = None, is_success: bool | None = None,
-               error_msg: str | None = None, need_refresh: bool = False):
+               error_msg: str | None = None, need_refresh: bool = False,
+               allow_activation: bool = True):
         """
         上报账号使用结果。遇到 401 自动触发静默刷新。
+
+        allow_activation=False 时（历史回溯使用）遇到 -2041 转入冷却，避免低优先级任务产生额外上游请求。
         """
+        if status_code in (403, 429, 499) or ret in (200013, -2013, -2014, -2041):
+            from backend.request_coordinator import request_coordinator
+            request_coordinator.note_upstream_restriction("account_pool_restricted")
         now = time.time()
         with self._lock:
             accounts = self._load()
@@ -220,7 +269,7 @@ class AccountPool:
             # 处理 401 认证过期 / 显式请求刷新
             if status_code == 401 or ret in (401, -2012) or need_refresh:
                 logger.info("账号 [%s] 认证过期，正在执行自动静默续期...", acc.get("nickname"))
-                refreshed = self._refresh_account_locked(acc)
+                refreshed = self._refresh_account_locked(acc) if allow_activation else False
                 if refreshed:
                     logger.info("账号 [%s] 静默续期成功！", acc.get("nickname"))
                     self._save(accounts)
@@ -237,7 +286,7 @@ class AccountPool:
                     return
 
             # 处理 499 -2041 会话未激活：自动发起 mobileSync 激活会话
-            if ret == -2041 or (status_code == 499 and "2041" in str(error_msg or "")):
+            if allow_activation and (ret == -2041 or (status_code == 499 and "2041" in str(error_msg or ""))):
                 try:
                     from backend.weread_signer import activate_terminal_session
                     h = {
@@ -629,13 +678,39 @@ class AccountPool:
 account_pool = AccountPool()
 
 
-def borrow_weread_session() -> tuple[str, str, str, dict]:
+_strict_local = threading.local()
+
+
+class strict_borrow:
+    """上下文管理器：在当前线程内让所有 borrow_weread_session() 调用都走strict，避免历史文章下载时候取用冷却中的账号
+    """
+
+    def __enter__(self):
+        _strict_local.depth = getattr(_strict_local, "depth", 0) + 1
+        return self
+
+    def __exit__(self, *exc):
+        _strict_local.depth = max(0, getattr(_strict_local, "depth", 1) - 1)
+        return False
+
+
+def is_strict_borrow_active() -> bool:
+    return getattr(_strict_local, "depth", 0) > 0
+
+
+def borrow_weread_session(strict: bool | None = None) -> tuple[str, str, str, dict]:
     """
     调度可用账号，返回 (account_id, vid, accessToken, auth_headers)。
     遇到无可用账号抛出 RuntimeError。
+
+    strict 未指定时跟随当前线程的 strict_borrow() 上下文。
     """
-    acc = account_pool.acquire()
+    if strict is None:
+        strict = is_strict_borrow_active()
+    acc = account_pool.acquire(strict=strict)
     if not acc:
+        if strict:
+            raise RuntimeError("微信读书账号池中暂无严格可用账号（均在冷却或失效），历史回溯已暂停等待")
         raise RuntimeError("微信读书账号池中暂无可用账号，请先在『账号池』页面扫码登录")
     account_id = acc["id"]
     vid = str(acc.get("vid", ""))
@@ -694,9 +769,10 @@ def get_weread_session():
             if _weread_session is None:
                 import requests
                 from requests.adapters import HTTPAdapter
-                s = requests.Session()
+                from backend.request_coordinator import CoordinatedSession
+                s = CoordinatedSession()
                 s.trust_env = False
-                adapter = HTTPAdapter(pool_connections=20, pool_maxsize=20, max_retries=1)
+                adapter = HTTPAdapter(pool_connections=20, pool_maxsize=20, max_retries=0)
                 s.mount("https://", adapter)
                 s.mount("http://", adapter)
                 _weread_session = s

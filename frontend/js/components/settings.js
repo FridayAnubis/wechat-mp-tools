@@ -5,6 +5,20 @@ const SettingsPage = {
     settings: {},
     cookiePollTimer: null,
 
+    // 历史回溯配置：[输入框 id, 配置键, 类型]，保存时走 /api/backfill/settings 服务端校验
+    BACKFILL_FIELDS: [
+        ['setting-backfill-auto', 'backfill_auto_enabled', 'bool'],
+        ['setting-backfill-batch', 'backfill_scan_batch_size', 'int'],
+        ['setting-backfill-daily', 'backfill_daily_download_limit', 'int'],
+        ['setting-backfill-interval', 'backfill_min_interval_minutes', 'int'],
+        ['setting-backfill-req-interval', 'backfill_request_interval_seconds', 'float'],
+        ['setting-backfill-start', 'backfill_start_hour', 'int'],
+        ['setting-backfill-end', 'backfill_end_hour', 'int'],
+        ['setting-backfill-guard', 'backfill_rss_guard_seconds', 'int'],
+        ['setting-rss-include-backfill', 'rss_include_backfill', 'bool'],
+        ['setting-backfill-upload-enabled', 'backfill_upload_enabled', 'bool'],
+    ],
+
     render() {
         let startOptions = '';
         for (let i = 0; i <= 23; i++) {
@@ -206,6 +220,13 @@ const SettingsPage = {
                         </div>
                         <div id="setting-rss-upload-panel" style="display: none;">
                             <div class="form-group" style="margin-top: var(--spacing-md);">
+                                <label class="form-checkbox-label" style="display: flex; align-items: center; gap: 8px; cursor: pointer; user-select: none;">
+                                    <input type="checkbox" id="setting-backfill-upload-enabled" style="width: 18px; height: 18px; accent-color: var(--primary);" />
+                                    <span>同时上传历史回溯补抓的旧文章</span>
+                                </label>
+                                <div class="form-hint">默认关闭：历史回溯下载的旧文章不会触发大量重新上传</div>
+                            </div>
+                            <div class="form-group" style="margin-top: var(--spacing-md);">
                                 <label class="form-label" for="setting-device-id">设备 ID (deviceId)</label>
                                 <input type="text" class="form-input" id="setting-device-id" placeholder="请输入设备 ID..." />
                                 <div class="form-hint">RSS 上传接口 payload 中的 deviceId 配置</div>
@@ -216,6 +237,72 @@ const SettingsPage = {
                                 <div class="form-hint">接口接收 articles 与 deviceId；正文 content 会以 base64 字符串上传</div>
                             </div>
                         </div>
+                    </div>
+                </div>
+
+                <!-- 历史文章回溯配置 -->
+                <div class="card">
+                    <div class="card-header">
+                        <h3 class="card-title">🕘 历史文章回溯</h3>
+                    </div>
+                    <div class="card-body" style="padding: 0 var(--spacing-md) var(--spacing-md);">
+                        <div class="form-group">
+                            <label class="form-label" for="setting-backfill-token">管理令牌（部署配置了令牌时填写）</label>
+                            <input type="password" class="form-input" id="setting-backfill-token" autocomplete="off"
+                                placeholder="仅保存在当前浏览器标签页"
+                                oninput="sessionStorage.setItem('backfillAdminToken', this.value)" />
+                        </div>
+                        <div class="form-group" style="margin-top: var(--spacing-md);">
+                            <label class="form-checkbox-label" style="display: flex; align-items: center; gap: 8px; cursor: pointer; user-select: none;">
+                                <input type="checkbox" id="setting-backfill-auto" style="width: 18px; height: 18px; accent-color: var(--primary);" />
+                                <span>启用空闲自动回溯（全局开关）</span>
+                            </label>
+                            <div class="form-hint">默认关闭。开启后，还需在公众号的「获取历史」弹窗中为该号单独开启；手动「立即获取一批」不受此开关影响</div>
+                        </div>
+                        <div style="display: flex; gap: 16px;">
+                            <div class="form-group" style="flex: 1;">
+                                <label class="form-label" for="setting-backfill-batch">单批扫描条数</label>
+                                <input type="number" class="form-input" id="setting-backfill-batch" min="5" max="30" />
+                                <div class="form-hint">5–30，单轮最多扫描的历史章节</div>
+                            </div>
+                            <div class="form-group" style="flex: 1;">
+                                <label class="form-label" for="setting-backfill-daily">单号每日下载上限</label>
+                                <input type="number" class="form-input" id="setting-backfill-daily" min="0" max="1000" />
+                                <div class="form-hint">0 表示只扫描不下载</div>
+                            </div>
+                        </div>
+                        <div style="display: flex; gap: 16px;">
+                            <div class="form-group" style="flex: 1;">
+                                <label class="form-label" for="setting-backfill-interval">两批最小间隔 (分钟)</label>
+                                <input type="number" class="form-input" id="setting-backfill-interval" min="1" max="1440" />
+                            </div>
+                            <div class="form-group" style="flex: 1;">
+                                <label class="form-label" for="setting-backfill-req-interval">请求最小间隔 (秒)</label>
+                                <input type="number" class="form-input" id="setting-backfill-req-interval" min="2" max="300" step="0.5" />
+                            </div>
+                        </div>
+                        <div style="display: flex; gap: 16px;">
+                            <div class="form-group" style="flex: 1;">
+                                <label class="form-label" for="setting-backfill-start">允许开始 (点)</label>
+                                <input type="number" class="form-input" id="setting-backfill-start" min="0" max="23" />
+                            </div>
+                            <div class="form-group" style="flex: 1;">
+                                <label class="form-label" for="setting-backfill-end">允许结束 (点)</label>
+                                <input type="number" class="form-input" id="setting-backfill-end" min="1" max="24" />
+                            </div>
+                            <div class="form-group" style="flex: 1;">
+                                <label class="form-label" for="setting-backfill-guard">RSS 到期保护 (秒)</label>
+                                <input type="number" class="form-input" id="setting-backfill-guard" min="0" max="3600" />
+                            </div>
+                        </div>
+                        <div class="form-group">
+                            <label class="form-checkbox-label" style="display: flex; align-items: center; gap: 8px; cursor: pointer; user-select: none;">
+                                <input type="checkbox" id="setting-rss-include-backfill" style="width: 18px; height: 18px; accent-color: var(--primary);" />
+                                <span>最新 RSS Feed 包含回溯补抓的旧文章</span>
+                            </label>
+                            <div class="form-hint">默认关闭，避免旧文章突然涌入订阅；需要完整归档时可单独访问 Feed 地址加 <code>?include_backfill=1</code></div>
+                        </div>
+                        <div class="form-hint">以上均为保守起点，并非平台保证的安全阈值；遇验证码 / 限流会自动暂停或冷却。</div>
                     </div>
                 </div>
             </div>
@@ -310,8 +397,30 @@ const SettingsPage = {
         if (biliQuality) biliQuality.value = data.bili_video_quality || '1080p';
         if (biliDanmaku) biliDanmaku.checked = data.bili_download_danmaku !== undefined ? !!data.bili_download_danmaku : true;
         if (biliSubtitle) biliSubtitle.checked = data.bili_download_subtitle !== undefined ? !!data.bili_download_subtitle : true;
+        this.BACKFILL_FIELDS.forEach(([id, key, type]) => {
+            const el = document.getElementById(id);
+            if (!el || data[key] === undefined) return;
+            if (type === 'bool') el.checked = !!data[key];
+            else el.value = data[key];
+        });
         this.toggleRssUpload();
         this.syncRssEndMinute();
+    },
+
+    collectBackfillSettings() {
+        const out = {};
+        for (const [id, key, type] of this.BACKFILL_FIELDS) {
+            const el = document.getElementById(id);
+            if (!el) continue;
+            if (type === 'bool') {
+                out[key] = el.checked;
+            } else {
+                const num = type === 'int' ? parseInt(el.value, 10) : parseFloat(el.value);
+                if (Number.isNaN(num)) return { error: `「${el.closest('.form-group')?.querySelector('.form-label')?.textContent || key}」请输入数字` };
+                out[key] = num;
+            }
+        }
+        return { values: out };
     },
 
 
@@ -368,6 +477,11 @@ const SettingsPage = {
             Toast.warning('延迟时间输入不合法，最小为 0.1 秒');
             return;
         }
+        const backfill = this.collectBackfillSettings();
+        if (backfill.error) {
+            Toast.warning(backfill.error);
+            return;
+        }
 
         const settings = {
             ...this.settings,
@@ -397,6 +511,9 @@ const SettingsPage = {
 
         try {
             await API.settings.save(settings);
+            // 历史回溯配置单独提交，由服务端校验取值范围；失败时保留原值
+            const res = await API.backfill.saveSettings(backfill.values);
+            Object.assign(settings, res.settings || backfill.values);
             Toast.success('设置已保存');
             this.settings = settings;
         } catch (err) {
@@ -427,6 +544,18 @@ const SettingsPage = {
                 bili_video_quality: '1080p',
                 bili_download_danmaku: true,
                 bili_download_subtitle: true,
+                backfill_auto_enabled: false,
+                backfill_scan_batch_size: 10,
+                backfill_daily_download_limit: 40,
+                backfill_min_interval_minutes: 10,
+                backfill_page_overlap: 5,
+                backfill_rss_guard_seconds: 120,
+                backfill_request_interval_seconds: 5,
+                backfill_max_attempts: 3,
+                backfill_start_hour: 0,
+                backfill_end_hour: 24,
+                rss_include_backfill: false,
+                backfill_upload_enabled: false,
             };
             try {
                 await API.settings.save(defaults);

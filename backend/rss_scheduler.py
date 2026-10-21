@@ -14,7 +14,7 @@ import random
 import requests
 from pathlib import Path
 
-from backend.config import DATA_DIR, load_json, save_json, normalize_wechat_url
+from backend.config import DATA_DIR, DOWNLOAD_HISTORY_LOCK, load_json, save_json, normalize_wechat_url
 
 logger = logging.getLogger(__name__)
 
@@ -22,8 +22,8 @@ RSS_SUBSCRIPTIONS_FILE = DATA_DIR / "rss_subscriptions.json"
 RSS_ARTICLES_FILE = DATA_DIR / "rss_articles.json"
 RSS_UPLOAD_LOG_FILE = DATA_DIR / "rss_upload_log.json"
 
-# 每个公众号 RSS 最多保留的文章数
-MAX_ARTICLES_PER_ACCOUNT = 200
+# 原 MAX_ARTICLES_PER_ACCOUNT = 200 已移除：订阅缓存不再按篇数截断，完整索引保存在
+# data/backfill.db（backend/backfill_store.py），rss_articles.json 仅作为不截断的兼容导出。
 
 # 单次上传最多携带的文章数（超出部分留待下一轮）
 UPLOAD_BATCH_LIMIT = 100
@@ -49,7 +49,8 @@ class RssScheduler:
         self._thread = None
         self._stop_event = threading.Event()
         self._lock = threading.Lock()          # 保护 rss_subscriptions.json
-        self._history_lock = threading.Lock()  # 保护 DOWNLOAD_HISTORY_FILE 读改写
+        # 保护 DOWNLOAD_HISTORY_FILE 读改写：与手动下载、历史回溯共用同一把锁（config.DOWNLOAD_HISTORY_LOCK）
+        self._history_lock = DOWNLOAD_HISTORY_LOCK
         self._executor = ThreadPoolExecutor(max_workers=MAX_FETCH_WORKERS, thread_name_prefix="rss-fetch")
         self._fetching: set[str] = set()       # 正在抓取中的 fakeid，防重复提交
         self._fetching_lock = threading.Lock() # 保护 _fetching 集合
@@ -179,13 +180,49 @@ class RssScheduler:
 
     # ── 文章存储 ──────────────────────────────────────────
 
+    @staticmethod
+    def _archive_store():
+        """持久化文章索引；初始化失败时返回 None，调用方回落到旧 JSON 行为"""
+        try:
+            from backend.backfill_store import get_store
+
+            return get_store()
+        except Exception as exc:  # noqa: BLE001
+            logger.error("文章索引不可用，回落到 rss_articles.json: %s", exc)
+            return None
+
     def get_articles(self, nickname: str) -> list:
+        """某公众号的订阅缓存（不截断，按发布时间倒序）；优先读持久化索引"""
+        store = self._archive_store()
+        if store is not None:
+            try:
+                return store.rss_cached_articles(nickname).get(nickname, [])
+            except Exception as exc:  # noqa: BLE001
+                logger.error("读取文章索引失败，回落到 rss_articles.json: %s", exc)
         all_articles = load_json(RSS_ARTICLES_FILE, {})
         return all_articles.get(nickname, [])
 
-    def _save_articles(self, nickname: str, articles: list):
+    def _save_articles(self, nickname: str, articles: list, fakeid: str | None = None):
+        store = self._archive_store()
+        if store is not None:
+            from backend import backfill_store as bs
+
+            fid = fakeid or bs.fakeid_for_account(nickname)
+            with store.transaction() as conn:
+                for art in articles:
+                    if not isinstance(art, dict):
+                        continue
+                    path = str(art.get("path") or "")
+                    store.upsert_article(
+                        fid, {**art, "account_name": nickname}, source="rss_latest", conn=conn,
+                        feed_visible=True, rss_cached=True,
+                        download_status=bs.DL_DOWNLOADED if path else bs.DL_PERMANENT, local_path=path,
+                    )
+        # 兼容导出（不截断）：回滚到旧版本时旧代码仍能读到完整订阅缓存
         all_articles = load_json(RSS_ARTICLES_FILE, {})
-        all_articles[nickname] = articles[:MAX_ARTICLES_PER_ACCOUNT]
+        if not isinstance(all_articles, dict):
+            all_articles = {}
+        all_articles[nickname] = articles
         save_json(RSS_ARTICLES_FILE, all_articles)
 
     # ── 新文章上传 ────────────────────────────────────────
@@ -255,16 +292,29 @@ class RssScheduler:
         return None
 
     # 以下载历史为唯一事实来源：候选 = success 且未上传、未隔离的条目
+    # 历史回溯补抓的旧文章（backfill=True）默认不参与上传，避免一次回溯触发大量历史重新上传；
+    # 设置 backfill_upload_enabled=true 后才会一并上传。
+
+    @staticmethod
+    def _include_backfill_uploads() -> bool:
+        from backend.config import get_settings
+
+        return bool(get_settings().get("backfill_upload_enabled", False))
+
+    @staticmethod
+    def _upload_eligible(item, include_backfill: bool) -> bool:
+        return (
+            isinstance(item, dict) and bool(item.get("success")) and not item.get("uploaded")
+            and not item.get("upload_quarantined") and bool(item.get("link"))
+            and (include_backfill or not item.get("backfill"))
+        )
 
     def _collect_unuploaded(self, history: list, account: str | None = None) -> list:
         """从下载历史中挑出待上传的条目（直接返回 history 中的对象引用，便于原地标记）"""
+        include_backfill = self._include_backfill_uploads()
         out = []
         for item in history:
-            if not isinstance(item, dict):
-                continue
-            if not item.get("success") or item.get("uploaded") or item.get("upload_quarantined"):
-                continue
-            if not item.get("link"):
+            if not self._upload_eligible(item, include_backfill):
                 continue
             if account is not None and item.get("account") != account:
                 continue
@@ -274,10 +324,10 @@ class RssScheduler:
         return out
 
     def count_pending(self, history: list, account: str | None = None) -> int:
+        include_backfill = self._include_backfill_uploads()
         return sum(
             1 for it in history
-            if isinstance(it, dict) and it.get("success") and not it.get("uploaded")
-            and not it.get("upload_quarantined") and it.get("link")
+            if self._upload_eligible(it, include_backfill)
             and (account is None or it.get("account") == account)
         )
 
@@ -597,19 +647,62 @@ class RssScheduler:
 
     def _fetch_wrapper(self, sub: dict):
         """线程池执行入口：执行抓取并在完成后清理 _fetching 状态"""
+        from backend.request_coordinator import request_coordinator
+
         try:
-            self._fetch_for_account(sub)
+            # 登记为前台任务：历史回溯会在下一次请求前让路
+            with request_coordinator.foreground(f"rss:{sub.get('fakeid', '')}"):
+                self._fetch_for_account(sub)
         except Exception as e:
             logger.error("RSS 抓取线程异常 [%s]: %s", sub.get("nickname", ""), e)
         finally:
             with self._fetching_lock:
                 self._fetching.discard(sub.get("fakeid", ""))
 
+    def is_fetching(self) -> bool:
+        with self._fetching_lock:
+            return bool(self._fetching)
+
+    def seconds_until_next_due(self, now: float | None = None) -> float | None:
+        """距离最近一个订阅到期还有多少秒；不在采集时段或没有启用的订阅时返回 None"""
+        if not self.is_in_fetch_window():
+            return None
+        now = time.time() if now is None else now
+        due = [self._safe_float(s.get("next_fetch_time"), 0) for s in self.get_subscriptions() if s.get("enabled")]
+        if not due:
+            return None
+        return min(due) - now
+
+    @staticmethod
+    def _merge_history_record(history: list, by_link: dict, record: dict, success: bool, nickname: str):
+        """把本轮下载结果合并进（锁内读取的）最新下载历史：按归一化链接匹配"""
+        norm_link = normalize_wechat_url(record.get("link", ""))
+        match = by_link.get(norm_link) if norm_link else None
+        if match is None:
+            history.append(record)
+            if norm_link:
+                by_link[norm_link] = record
+            return
+        # 只有当新结果成功，或者之前也是失败时，才更新（避免用失败覆盖成功）
+        if success or not match.get("success"):
+            match["success"] = success
+            match["time"] = record["time"]
+            match["error"] = record.get("error")
+            match["path"] = record.get("path")
+            match["account"] = nickname
+            for key in ("cover_url", "digest", "publish_time"):
+                if record.get(key):
+                    match[key] = record[key]
+            if success and match.get("backfill"):
+                # 历史回溯下载过、现在又出现在最新同步里：视为最新文章
+                match["backfill"] = False
+                match["promoted_from_backfill"] = True
+
     def _fetch_for_account(self, sub: dict):
         """为单个订阅抓取最新文章并执行离线下载（由线程池调度）"""
         from backend.articles import _fetch_articles_page
         from backend.downloader import download_single_article
-        from backend.config import load_json, save_json, DOWNLOAD_HISTORY_FILE, OUTPUT_DIR, get_settings
+        from backend.config import load_json, DOWNLOAD_HISTORY_FILE, OUTPUT_DIR, get_settings, update_download_history
         import random
 
         fakeid = sub["fakeid"]
@@ -619,55 +712,65 @@ class RssScheduler:
         new_count = 0
         total_articles = sub.get("total_articles", 0)
         upload_result = None
+        history: list = []
 
         # 错峰延时：随机等待 3 到 8 秒，分散高并发请求，避免触发微信风控
         time.sleep(random.uniform(3.0, 8.0))
 
         try:
+            store = self._archive_store()
             existing = self.get_articles(nickname)
             existing_links = {normalize_wechat_url(a.get("link")) for a in existing if a.get("link")}
-            
-            # 加载历史记录，用于归一化链接去重和 (账号, 标题) 双重兜底去重（仅针对已成功下载的记录去重，失败记录允许重新尝试下载）
-            history = load_json(DOWNLOAD_HISTORY_FILE, [])
-            history_links = {normalize_wechat_url(item.get("link")) for item in history if isinstance(item, dict) and item.get("link") and item.get("success")}
-            history_titles = {(item.get("account"), item.get("title")) for item in history if isinstance(item, dict) and item.get("account") and item.get("title") and item.get("success")}
+
+            # 只读快照：用于归一化链接去重和 (账号, 标题, 发布时间接近) 兜底去重
+            # （仅针对已成功下载的记录去重，失败记录允许重新尝试下载）
+            snapshot = load_json(DOWNLOAD_HISTORY_FILE, [])
+            history_links = {normalize_wechat_url(item.get("link")) for item in snapshot if isinstance(item, dict) and item.get("link") and item.get("success")}
 
             new_articles = []
+            promoted = []          # 历史回溯已下载、本轮出现在最新列表中的文章 → 提升为 Feed 可见
+            records = []           # 本轮下载产生的历史记录 (record, success)，提交阶段在共享锁内合并
             begin = 0
             count = 10
             max_pages = 5 # 限制最大翻页数，防死循环
-            
+
             try:
                 for page_idx in range(max_pages):
                     res = _fetch_articles_page(fakeid, begin=begin, count=count, account_name=nickname)
                     page_articles, _total = res[0], res[1]
                     if not page_articles:
                         break
-                    
+
                     has_old_article = False
                     for art in page_articles:
                         link = art.get("link", "")
                         title = art.get("title", "")
                         norm_link = normalize_wechat_url(link)
-                        
-                        # 查重：若规范化 URL 在 RSS/历史记录中，或者 (公众号, 标题) 已存在，均判定为老文章
+                        archived = None
+                        if store is not None:
+                            try:
+                                archived = store.find_article(fakeid, art)
+                            except Exception:  # noqa: BLE001
+                                archived = None
+
+                        # 查重：规范化 URL 在 RSS/历史记录中、或文章索引中已下载，均判定为老文章
                         is_duplicate = (
                             (norm_link and (norm_link in existing_links or norm_link in history_links))
-                            or ((nickname, title) in history_titles)
+                            or bool(archived and archived.get("download_status") == "downloaded")
                         )
                         if is_duplicate:
                             has_old_article = True
+                            if archived and not archived.get("feed_visible"):
+                                promoted.append((art, archived))
                         else:
                             new_articles.append(art)
                             if norm_link:
                                 existing_links.add(norm_link)
-                            if title:
-                                history_titles.add((nickname, title))
-                    
+
                     # 如果当前页中包含了已有的老文章，或者新文章总数已经满足，或者返回的文章长度小于请求数，或者已抓完总数
                     if has_old_article or len(page_articles) < count or (begin + len(page_articles) >= _total):
                         break
-                    
+
                     begin += count
                     # 翻页间稍作延时，避免被微信风控
                     time.sleep(random.uniform(2.0, 4.5))
@@ -689,8 +792,6 @@ class RssScheduler:
                         if not link:
                             continue
 
-                        norm_link = normalize_wechat_url(link)
-
                         # 尝试下载
                         success = False
                         downloaded_path = None
@@ -709,49 +810,22 @@ class RssScheduler:
                                 error_msg = str(e)
                             time.sleep(1)
 
-                        # 寻找历史记录中是否已存在该链接或标题
-                        existing_history_item = None
-                        for item in history:
-                            if isinstance(item, dict):
-                                item_link = normalize_wechat_url(item.get("link", ""))
-                                if (norm_link and item_link == norm_link) or (item.get("account") == nickname and item.get("title") == title):
-                                    existing_history_item = item
-                                    break
-
                         is_permanent = result.get("is_permanent", False) if isinstance(result, dict) else False
 
-                        if existing_history_item:
-                            # 只有当新结果成功，或者之前也是失败时，才更新（避免用失败覆盖成功）
-                            if success or not existing_history_item.get("success"):
-                                existing_history_item["success"] = success
-                                existing_history_item["time"] = time.time()
-                                existing_history_item["error"] = error_msg if not success else None
-                                existing_history_item["path"] = downloaded_path
-                                existing_history_item["account"] = nickname
-                                if result.get("cover_url"):
-                                    existing_history_item["cover_url"] = result.get("cover_url")
-                                if result.get("digest"):
-                                    existing_history_item["digest"] = result.get("digest")
-                                if result.get("publish_time"):
-                                    existing_history_item["publish_time"] = result["publish_time"]
-                        else:
-                            existing_history_item = {
-                                "title": result.get("title") or title,
-                                "link": link,
-                                "account": nickname,
-                                "success": success,
-                                "time": time.time(),
-                                "error": error_msg if not success else None,
-                                "path": downloaded_path,
-                                "cover_url": result.get("cover_url") or art.get("cover", ""),
-                                "digest": result.get("digest") or art.get("digest", ""),
-                                "publish_time": result.get("publish_time") or art.get("update_time", int(time.time())),
-                            }
-                            history.append(existing_history_item)
-                            if norm_link:
-                                history_links.add(norm_link)
-                            if title:
-                                history_titles.add((nickname, title))
+                        records.append(({
+                            "title": result.get("title") or title,
+                            "link": link,
+                            "account": nickname,
+                            "success": success,
+                            "time": time.time(),
+                            "error": error_msg if not success else None,
+                            "path": downloaded_path,
+                            "cover_url": result.get("cover_url") or art.get("cover", ""),
+                            "digest": result.get("digest") or art.get("digest", ""),
+                            "publish_time": result.get("publish_time") or art.get("update_time", int(time.time())),
+                        }, success))
+                        if norm_link := normalize_wechat_url(link):
+                            history_links.add(norm_link)
 
                         # 仅在下载成功，或该失败是永久性失败（如作者已删除/内容被屏蔽）时，才加入到订阅缓存列表中（防止重复重试）
                         if success or is_permanent:
@@ -763,9 +837,19 @@ class RssScheduler:
                                 "author": nickname,
                                 "update_time": result.get("publish_time") or art.get("update_time", int(time.time())),
                                 "path": downloaded_path or "",
+                                "id": art.get("id") or "",
                             }
                             existing.insert(0, rss_item)
                             new_count += 1
+                            # 若这篇正排在历史回溯下载队列里，直接出队，避免重复下载
+                            if success and store is not None:
+                                try:
+                                    row = store.find_article(fakeid, rss_item)
+                                    if row:
+                                        store.mark_pending_done(fakeid, row["article_key"],
+                                                                local_path=downloaded_path or "", count_quota=False)
+                                except Exception as exc:  # noqa: BLE001
+                                    logger.debug("回溯队列出队失败: %s", exc)
 
                         # 避免抓取频率过快，加入延迟
                         if i < len(new_articles) - 1:
@@ -778,41 +862,48 @@ class RssScheduler:
                 last_error = str(e)
                 logger.warning("RSS 抓取失败 [%s]: %s", nickname, e)
 
-            # 截断保留上限
-            existing = existing[:MAX_ARTICLES_PER_ACCOUNT]
-            self._save_articles(nickname, existing)
-            
-            # ── 提交阶段：加锁合并 + 上传 + 保存 ──
-            _upload_fields = {"uploaded", "upload_time", "upload_error", "upload_quarantined", "upload_attempts"}
-            with self._history_lock:
-                # 重新读取磁盘版本，合并其他线程的并发修改
-                disk_history = load_json(DOWNLOAD_HISTORY_FILE, [])
-                disk_by_link = {
-                    it["link"]: it for it in disk_history
+            # 订阅缓存写入持久化索引（不再截断保留上限）
+            self._save_articles(nickname, existing, fakeid=fakeid)
+
+            promoted_links = set()
+            promoted_paths = set()
+            if store is not None:
+                for art, archived in promoted:
+                    try:
+                        store.upsert_article(fakeid, {**art, "account_name": nickname}, source="rss_latest",
+                                             feed_visible=True)
+                    except Exception as exc:  # noqa: BLE001
+                        logger.debug("提升回溯文章 Feed 可见失败: %s", exc)
+                    if archived.get("normalized_url"):
+                        promoted_links.add(archived["normalized_url"])
+                    if archived.get("local_path"):
+                        promoted_paths.add(archived["local_path"])
+
+            # ── 提交阶段：共享锁内读取最新下载历史 → 合并本轮结果 → 上传 → 原子保存 ──
+            def _commit(disk_history: list):
+                nonlocal history, total_articles, upload_result
+                by_link = {
+                    normalize_wechat_url(it["link"]): it for it in disk_history
                     if isinstance(it, dict) and it.get("link")
                 }
-                # 将本线程下载阶段的修改合并到磁盘版本中
-                for item in history:
-                    if not isinstance(item, dict) or not item.get("link"):
-                        continue
-                    link = item["link"]
-                    if link in disk_by_link:
-                        disk_item = disk_by_link[link]
-                        # 取本线程的下载字段，保留磁盘上的上传状态（可能被其他线程更新）
-                        for key, value in item.items():
-                            if key not in _upload_fields:
-                                disk_item[key] = value
-                    else:
-                        disk_history.append(item)
+                for record, success in records:
+                    self._merge_history_record(disk_history, by_link, record, success, nickname)
+                if promoted_links or promoted_paths:
+                    for it in disk_history:
+                        if not isinstance(it, dict) or not it.get("backfill"):
+                            continue
+                        if normalize_wechat_url(it.get("link", "")) in promoted_links or it.get("path") in promoted_paths:
+                            it["backfill"] = False
+                            it["promoted_from_backfill"] = True
                 history = disk_history
-
                 total_articles = sum(
-                    1 for item in history
+                    1 for item in disk_history
                     if isinstance(item, dict) and item.get("account") == nickname and item.get("success")
                 )
                 # 以下载历史为准上传（本轮新文章 + 历史中所有未上传/未隔离的文章会一并重试）
-                upload_result = self._run_upload(history, trigger="auto", account=nickname)
-                save_json(DOWNLOAD_HISTORY_FILE, history)
+                upload_result = self._run_upload(disk_history, trigger="auto", account=nickname)
+
+            update_download_history(_commit)
 
         except Exception as outer_e:
             if not last_error:
