@@ -199,3 +199,210 @@ def test_manual_batch_preserves_concurrent_history_append(env, monkeypatch):
     history = json.loads(config.DOWNLOAD_HISTORY_FILE.read_text())
     assert len(history) == 2 and {r['title'] for r in history} == {'旧文章999', '手动下载'}
     assert store.count_articles(FAKEID)['downloaded'] == 1
+
+
+# 请求层使用真实下载函数和离线 HTTP 响应，覆盖 FakeDownloader 无法发现的正文链路错误。
+def article_response(html, *, status=200, url='https://mp.weixin.qq.com/s/offlineArticle000000001',
+                     content_type='text/html; charset=utf-8', encoding=None):
+    response = requests.Response()
+    response.status_code = status
+    response.url = url
+    response._content = html.encode('utf-8') if isinstance(html, str) else html
+    response.headers['Content-Type'] = content_type
+    if encoding:
+        response.headers['Content-Encoding'] = encoding
+    return response
+
+
+@pytest.mark.parametrize('review_id,expected', [
+    ('MP_WXS_3286016687_yvLKiOm~5JBieS0oLN~BMQ', 'yvLKiOm_5JBieS0oLN_BMQ'),
+    ('MP_WXS_1_abcd_efgh_ijklmnopqr', 'abcd_efgh_ijklmnopqr'),
+    ('MP_WXS_0_abcd~efgh~ijklmnopqr', 'abcd_efgh_ijklmnopqr'),
+    ('other_abcdefghijklmnopq', ''),
+    ('MP_WXS_1_abcdefghijklmnopq?token=secret', ''),
+])
+def test_shared_review_link_conversion(review_id, expected):
+    from backend.backfill_upstream import short_link_from_review_id
+    url = f'https://mp.weixin.qq.com/s/{expected}' if expected else ''
+    assert short_link_from_review_id(review_id) == url
+    if expected:
+        assert downloader.resolve_canonical_short_url('', review_id) == url
+        assert articles._resolve_review_doc_url(review_id, {}) == url
+
+
+def test_parser_preserves_explicit_doc_url():
+    from backend.backfill_upstream import parse_chapters_response
+    original = 'https://mp.weixin.qq.com/s?__biz=offline&mid=1&idx=1&sn=offline'
+    review = 'MP_WXS_1_abcdefghijkl~mnopqr'
+    page = parse_chapters_response(200, json.dumps({'data': [
+        {'reviewId': review, 'mpInfo': {'title': '文章', 'doc_url': original}}
+    ], 'hasMore': False}), offset=0, count=10)
+    assert page.articles[0]['link'] == page.articles[0]['doc_url'] == original
+    assert page.articles[0]['derived_short_url'].endswith('/abcdefghijkl_mnopqr')
+
+
+@pytest.mark.parametrize('html,expected', [
+    ("<div data-x='1' id = 'js_content'><p>正文</p></div>", 'article'),
+    ("<section class='extra rich_media_content'><p>正文</p></section>", 'article'),
+    ("<div id='js_content'><img data-src='https://example.invalid/image.jpg'></div>", 'article'),
+    ("<div id='js_content'><iframe data-mpvid='offline-video'></iframe></div>", 'article'),
+    ("<div id='js_article'><p>正文</p></div>", 'article'),
+    ("<div id='js_article'><h1>只有标题</h1></div>", 'invalid'),
+    ("<div id='js_content'> &nbsp;<script>var x='非正文';</script></div>", 'invalid'),
+    ('<html><p>参数错误</p></html>', 'invalid'),
+    ('<html><input type="password">请登录</html>', 'invalid'),
+    ('<div id="app">登录</div>', 'invalid'),
+    ('<html><p>内容已被作者删除</p></html>', 'permanent'),
+    ('<html>当前环境异常，完成验证后即可继续访问</html>', 'blocked'),
+    ("<script>var picture_page_info_list=[{cdn_url:'https://example.invalid/pic.jpg'}];</script>", 'article'),
+])
+def test_article_response_requires_meaningful_body(html, expected):
+    assert downloader._article_page_state(html)[0] == expected
+
+
+def test_real_downloader_tries_derived_link_after_http_200_error(env, monkeypatch):
+    _, path = env
+    original = 'https://mp.weixin.qq.com/s?__biz=offline&mid=1&idx=1&sn=offline'
+    review = 'MP_WXS_1_abcdefghijkl~mnopqr'
+    called = []
+    def get(url, **kwargs):
+        called.append(url)
+        assert kwargs['headers']['Accept-Encoding'] == 'gzip, deflate'
+        html = '<html>参数错误</html>' if len(called) == 1 else "<html><div id = 'js_content'><p>离线正文</p></div></html>"
+        return article_response(html, url=url)
+    monkeypatch.setattr(downloader, 'coordinated_get', get)
+    monkeypatch.setattr(downloader, 'fetch_via_weread_content', lambda *a: pytest.fail('正文成功后不应调用 Web'))
+    monkeypatch.setattr(downloader, 'fetch_via_headless_browser', lambda *a, **k: pytest.fail('不应启动浏览器'))
+    result = downloader.download_single_article(original, path/'articles', '链接还原', review_id=review)
+    assert result['success'], result
+    assert called == [original, 'https://mp.weixin.qq.com/s/abcdefghijkl_mnopqr']
+    assert '离线正文' in next(p for p in Path(result['path']).glob('*.html') if not p.name.endswith('_raw.html')).read_text()
+    assert '离线正文' in (Path(result['path'])/'content.txt').read_text()
+    assert (Path(result['path'])/'metadata.json').exists()
+
+
+def test_invalid_http_200_falls_through_to_web_with_full_cookie(env, monkeypatch):
+    from backend import account_pool as ap
+    cookie = 'wr_vid=offline; wr_skey=web-key; wr_rt=web-refresh; extra=preserved'
+    monkeypatch.setattr(ap.account_pool, 'acquire', lambda **kw: {'id': 'fake', 'vid': 'offline', 'web_cookie': cookie})
+    monkeypatch.setattr(downloader, 'coordinated_get', lambda *a, **k: article_response('<html>参数错误</html>'))
+    calls = []
+    class Session:
+        def get(self, url, **kwargs):
+            calls.append(kwargs)
+            return article_response("<div class='rich_media_content'><p>Web正文</p></div>", url=url)
+    monkeypatch.setattr(ap, 'get_weread_session', lambda: Session())
+    html, _, error = downloader.fetch_wechat_article_html('https://mp.weixin.qq.com/s/abcdefghijklmnopqr',
+                                                         'MP_WXS_1_abcdefghijklmnopqr')
+    assert 'Web正文' in html and not error
+    assert calls[0]['headers']['Cookie'] == cookie
+    assert 'accessToken' not in calls[0]['headers']
+
+
+@pytest.mark.parametrize('status,html', [(200, '<html>请登录</html>'), (401, '{}')])
+def test_web_auth_failure_is_diagnosable_without_logging_secrets(env, monkeypatch, caplog, status, html):
+    from backend import account_pool as ap
+    cookie = 'wr_vid=offline; wr_skey=PRIVATE-COOKIE; wr_rt=PRIVATE-REFRESH'
+    monkeypatch.setattr(ap.account_pool, 'acquire', lambda **kw: {'id': 'fake', 'web_cookie': cookie})
+    class Session:
+        def get(self, *a, **kw):
+            return article_response(html, status=status, url='https://weread.qq.com/login?token=PRIVATE-TOKEN#PRIVATE-FRAGMENT')
+    monkeypatch.setattr(ap, 'get_weread_session', lambda: Session())
+    monkeypatch.setattr(downloader, 'coordinated_get', lambda *a, **kw: article_response('<html>参数错误</html>'))
+    monkeypatch.setattr(downloader, 'in_backfill_network', lambda: True)
+    monkeypatch.setattr(downloader, 'fetch_via_headless_browser', lambda *a, **kw: pytest.fail('历史模式禁用浏览器'))
+    with caplog.at_level('INFO'):
+        body, _, error = downloader.fetch_wechat_article_html('https://mp.weixin.qq.com/s/abcdefghijklmnopqr',
+                                                              'MP_WXS_1_abcdefghijklmnopqr')
+    assert not body and 'channel=weread_web' in error and f'http={status}' in error
+    assert '参数错误' in error
+    assert 'PRIVATE-' not in error + caplog.text
+
+
+def test_mobile_credentials_do_not_impersonate_web_cookie(monkeypatch):
+    from backend import account_pool as ap
+    strict_calls = []
+    monkeypatch.setattr(ap.account_pool, 'acquire', lambda strict=False: strict_calls.append(strict) or {
+        'id': 'fake', 'accessToken': 'mobile-token', 'cookie_str': 'wr_vid=offline; wr_skey=mobile-token'})
+    monkeypatch.setattr(ap, 'get_weread_session', lambda: pytest.fail('没有 Web 会话时不应请求接口'))
+    diagnostics = []
+    with ap.strict_borrow():
+        assert downloader.fetch_via_weread_content('MP_WXS_1_abcdefghijklmnopqr', diagnostics) == ('', False)
+    assert strict_calls == [True]
+    assert 'auth_missing' in diagnostics[0] and 'Web Cookie' in diagnostics[0]
+
+
+def test_brotli_and_wrong_content_type_are_not_valid_html():
+    for response, message in (
+        (article_response(b'\xff\x90\x81', encoding='br'), 'Brotli'),
+        (article_response('{"data": "not html"}', content_type='application/json'), '响应不是 HTML'),
+    ):
+        diagnostics = []
+        body, _ = downloader._validate_article_response(response, 'wechat_http', diagnostics)
+        assert not body and message in diagnostics[-1]
+
+
+def test_explicit_deleted_page_remains_permanent(env, monkeypatch):
+    _, path = env
+    monkeypatch.setattr(downloader, 'coordinated_get', lambda *a, **kw: article_response('内容已被作者删除'))
+    monkeypatch.setattr(downloader, 'in_backfill_network', lambda: True)
+    result = downloader.download_single_article('https://mp.weixin.qq.com/s/offlineArticle000000001', path, '已删除')
+    assert not result['success'] and result['is_permanent'] and result['error'] == '作者已删除'
+
+
+def test_web_cookie_is_preserved_through_account_update(env):
+    from backend import account_pool as ap
+    pool = ap.AccountPool()
+    cookie = 'wr_vid=offline; wr_skey=WEB-KEY; wr_rt=WEB-REFRESH; extra=preserved'
+    data = {'vid': 'offline', 'accessToken': 'mobile-token', 'deviceId': 'offline-device',
+            'deviceName': 'offline', 'nickname': '离线账号', 'cookie_str': cookie}
+    created = pool.add_or_update(data)
+    updated = pool.add_or_update({k: v for k, v in data.items() if k != 'cookie_str'})
+    assert created['web_cookie'] == updated['web_cookie'] == cookie
+    assert 'web_cookie' not in pool.list_accounts()[0]
+
+
+def test_empty_forwarded_article_still_follows_original(env, monkeypatch):
+    _, path = env
+    target = 'https://mp.weixin.qq.com/s/forwardedOffline00000001'
+    calls = []
+    def fetch(url, **kwargs):
+        calls.append(url)
+        html = (f"<div id='js_content'></div><a id='js_share_source' data-url='{target}'></a>"
+                if len(calls) == 1 else "<div id='js_content'><p>转载正文</p></div>")
+        return html, url, ''
+    monkeypatch.setattr(downloader, 'fetch_wechat_article_html', fetch)
+    result = downloader.download_single_article('https://mp.weixin.qq.com/s/sourceOffline00000001', path, '转载')
+    assert result['success'] and calls[-1] == target
+
+
+def test_invalid_200_uses_valid_browser_only_for_normal_download(env, monkeypatch):
+    valid = "<div id='js_content'><p>浏览器正文</p></div>"
+    monkeypatch.setattr(downloader, 'coordinated_get', lambda *a, **kw: article_response('<div id="js_content"></div>'))
+    monkeypatch.setattr(downloader, 'fetch_via_headless_browser', lambda *a, **kw: (valid, ''))
+    html, _, error = downloader.fetch_wechat_article_html('https://mp.weixin.qq.com/s/sourceOffline00000001')
+    assert html == valid and not error
+
+
+def test_pending_legacy_bad_link_can_retry_with_corrected_short_url(env, monkeypatch):
+    from backfill_fakes import FakeUpstream
+    from test_history_backfill import make_service
+    store, path = env
+    review = 'MP_WXS_1_abcdefghijkl~mnopqr'
+    wrong = 'https://mp.weixin.qq.com/s/abcdefghijkl~mnopqr'
+    correct = 'https://mp.weixin.qq.com/s/abcdefghijkl_mnopqr'
+    store.ensure_state(FAKEID, NICK)
+    store.commit_scan_page(FAKEID, articles=[{'id': review, 'link': wrong, 'title': '旧队列', 'account_name': NICK}],
+                           cursor={'end_confirmed': 1}, enqueue=True)
+    called = []
+    def get(url, **kwargs):
+        called.append(url)
+        return article_response('<html>参数错误</html>' if url == wrong else "<div id='js_content'><p>旧任务恢复正文</p></div>", url=url)
+    monkeypatch.setattr(downloader, 'coordinated_get', get)
+    monkeypatch.setattr(downloader, 'fetch_via_headless_browser', lambda *a, **k: pytest.fail('历史任务不应调用浏览器'))
+    svc = make_service(store, path, FakeUpstream(0))
+    svc._downloader = lambda url, folder, title, review_id='': downloader.download_single_article(url, folder, title, review_id=review_id)
+    result = svc.submit_run(FAKEID, 10)
+    run = svc.execute_run(store.get_run(result['task_id']))
+    assert run['downloaded'] == 1 and store.count_articles(FAKEID)['downloaded'] == 1
+    assert called == [wrong, correct]

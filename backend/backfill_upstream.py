@@ -10,13 +10,14 @@
 上游协议假设（未在真实账号上验证，见 docs/history_backfill.md「上游假设」）：
   - mp/chapters?bookId=&count=&offset= 按发布时间倒序返回章节，列表字段为 data / chapters / list 之一
   - hasMore 显式为 false / 0 的 HTTP 200 合法响应才视为「可信末页」
-  - reviewId 形如 MP_WXS_<uin>_<短链 id>，短链 id 可直接拼出 https://mp.weixin.qq.com/s/<id>
+  - reviewId 形如 MP_WXS_<uin>_<token>；token 的 ~ 还原为 _，保留已有 _，候选短链仍需正文校验
 """
 
 from __future__ import annotations
 
 import json
 import logging
+import re
 from dataclasses import dataclass, field
 
 logger = logging.getLogger(__name__)
@@ -49,11 +50,8 @@ class ChapterPage:
 
 
 def short_link_from_review_id(review_id: str) -> str:
-    if review_id and "_" in review_id:
-        sid = review_id.rsplit("_", 1)[-1]
-        if len(sid) >= 15:
-            return f"https://mp.weixin.qq.com/s/{sid}"
-    return ""
+    match = re.fullmatch(r"MP_WXS_\d+_([A-Za-z0-9_~-]{15,})", review_id or "")
+    return f"https://mp.weixin.qq.com/s/{match[1].replace('~', '_')}" if match else ""
 
 
 def _parse_has_more(value):
@@ -147,12 +145,14 @@ def parse_chapters_response(status_code: int, text: str, *, offset: int, count: 
         review_id = item.get("reviewId") if isinstance(item.get("reviewId"), str) else ""
         title = str(info.get("title") or item.get("title") or "").strip()
         link = info.get("doc_url") if isinstance(info.get("doc_url"), str) else ""
-        link = short_link_from_review_id(review_id) or link
+        derived_short_url = short_link_from_review_id(review_id)
         publish_time = _int_or_none(item.get("createTime") or info.get("time")) or 0
         articles.append({
             "id": review_id,
             "review_id": review_id,
-            "link": link,
+            "link": link or derived_short_url,
+            "doc_url": link,
+            "derived_short_url": derived_short_url,
             "title": title,
             "cover": info.get("pic_url") or info.get("thumbUrl") or item.get("cover") or "",
             "digest": info.get("digest") or "",
@@ -259,9 +259,7 @@ class WereadHistoryAdapter:
             if resp.status_code != 200:
                 return ""
             mp_info = (resp.json() or {}).get("review", {}).get("mpInfo", {})
-            orig_id = mp_info.get("originalId", "")
-            if orig_id and len(orig_id) >= 15:
-                return f"https://mp.weixin.qq.com/s/{orig_id}"
-            return mp_info.get("doc_url", "") or ""
+            return (mp_info.get("doc_url") or
+                    short_link_from_review_id(f"MP_WXS_0_{mp_info.get('originalId', '')}"))
         except Exception:  # noqa: BLE001
             return ""

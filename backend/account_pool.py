@@ -128,6 +128,7 @@ class AccountPool:
                             "nickname": user.get("name") or f"微信读书用户_{vid}",
                             "avatar": user.get("avatar", ""),
                             "cookie_str": f"wr_vid={vid}; wr_skey={token}",
+                            "web_cookie": data.get("web_cookie") or data.get("cookie_str") or "",
                             "status": "active",
                             "failures": 0,
                             "save_time": time.time(),
@@ -509,6 +510,7 @@ class AccountPool:
                 target_acc = next((a for a in accounts if a.get("refreshToken") == rf), None)
 
             now = time.time()
+            web_cookie = cred.get("web_cookie") or cred.get("cookie_str")
             if target_acc:
                 target_acc["vid"] = vid or target_acc.get("vid", "")
                 target_acc["accessToken"] = token or target_acc.get("accessToken", "")
@@ -529,6 +531,8 @@ class AccountPool:
                 if avatar:
                     target_acc["avatar"] = avatar
                 target_acc["cookie_str"] = f"wr_vid={target_acc.get('vid')}; wr_skey={target_acc.get('skey')}"
+                if isinstance(web_cookie, str) and web_cookie:
+                    target_acc["web_cookie"] = web_cookie
                 target_acc["status"] = "active"
                 target_acc["failures"] = 0
                 target_acc["last_error"] = None
@@ -552,6 +556,7 @@ class AccountPool:
                     "nickname": nickname,
                     "avatar": avatar,
                     "cookie_str": f"wr_vid={vid}; wr_skey={token}",
+                    "web_cookie": web_cookie if isinstance(web_cookie, str) else "",
                     "status": "active",
                     "failures": 0,
                     "save_time": now,
@@ -732,6 +737,36 @@ def borrow_weread_session(strict: bool | None = None) -> tuple[str, str, str, di
     except Exception:
         pass
     return account_id, vid, token, headers
+
+
+def borrow_weread_web_session() -> dict:
+    """Web Cookie 独立于移动端 Token；保留 wr_rt 等所有已保存字段，不伪造 Web 凭证。"""
+    from http.cookies import SimpleCookie, CookieError
+
+    acc = account_pool.acquire(strict=is_strict_borrow_active())
+    if not acc:
+        raise RuntimeError("暂无可用的 Web 会话账号")
+    cookie = acc.get("web_cookie")
+    if not cookie:
+        # 兼容曾直接保存完整 Web Cookie 的旧账号；不把自动合成的两字段移动凭证当 Web 会话。
+        legacy = acc.get("cookie_str") or ""
+        cookie = legacy if "wr_rt=" in legacy else ""
+    try:
+        parsed = SimpleCookie()
+        parsed.load(cookie or "")
+    except CookieError:
+        raise RuntimeError("已保存的 Web Cookie 格式无效") from None
+    if not all(name in parsed and parsed[name].value for name in ("wr_vid", "wr_skey")):
+        raise RuntimeError("未保存独立 Web Cookie")
+    return {
+        "Cookie": cookie,
+        "User-Agent": "Mozilla/5.0",
+        "Referer": "https://weread.qq.com/",
+        "Origin": "https://weread.qq.com",
+        "Accept": "text/html,application/xhtml+xml",
+        "Accept-Encoding": "gzip, deflate",
+        "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+    }
 
 
 def borrow_session() -> tuple[str, str, str]:

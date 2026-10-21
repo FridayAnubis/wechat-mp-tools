@@ -434,7 +434,12 @@ class CoordinatedSession(requests.Session):
             ):
                 retry = _safe_float(response.headers.get("Retry-After"), 0)
                 until = coordinator.note_upstream_restriction(f"http_{response.status_code}", retry)
-                raise Preempted(Admission(False, REASON_GLOBAL_COOLDOWN, until, "上游限制，已停止后续请求"))
+                from urllib.parse import urlparse
+                target = urlparse(response.url or request.url)
+                logger.warning("历史请求受限: http=%s url=%s://%s%s",
+                               response.status_code, target.scheme, target.hostname, target.path)
+                raise Preempted(Admission(False, REASON_GLOBAL_COOLDOWN, until,
+                                         f"上游限制（HTTP {response.status_code}），已停止后续请求"))
         return response
 
 

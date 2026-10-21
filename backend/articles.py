@@ -28,6 +28,7 @@ from backend.config import (
 from backend.account_pool import borrow_session, borrow_weread_session, account_pool, get_weread_session
 from backend.accounts import biz_to_book_id
 from backend.runtime import desktop_available, host_path_hint
+from backend.backfill_upstream import short_link_from_review_id
 
 logger = logging.getLogger(__name__)
 
@@ -61,7 +62,7 @@ def _get_session():
 
 def fetch_article_detail_content(url: str, review_id: str = "") -> str:
     """抓取微信公众号文章网页并提取 HTML 正文（.rich_media_content），还原图片 data-src
-    参考 we-mp-rss 优化：支持微信读书免风控正文接口、移动微信高仿请求与无头浏览器兜底
+    使用经过正文校验的 HTTP／微信读书 Web／浏览器抓取结果。
     """
     import bs4
     from backend.downloader import fetch_wechat_article_html
@@ -88,15 +89,14 @@ _review_cache_lock = threading.Lock()
 
 
 def _resolve_review_doc_url(review_id: str, headers: dict) -> str:
-    """通过微信读书 review/single 接口解析原生微信推文链接 (优先解析为免风控短链)"""
+    """从 reviewId 或 review/single 获取候选文章链接。"""
     if not review_id:
         return ""
     # 优先直接使用 review_id 包含的短链标识（如 MP_WXS_2940696320_yvrxT0XE-9ELBG4gQZhB4g -> yvrxT0XE-9ELBG4gQZhB4g）
-    # 短链在微信网关下直接返回文章内容，完全绕过长链接引发的风控验证码
-    if "_" in review_id:
-        sid = review_id.split("_")[-1]
-        if len(sid) >= 15:
-            return f"https://mp.weixin.qq.com/s/{sid}"
+    # 候选短链仍需在下载时检查真实正文和访问限制。
+    derived = short_link_from_review_id(review_id)
+    if derived:
+        return derived
 
     with _review_cache_lock:
         if review_id in _review_url_cache:
@@ -107,11 +107,8 @@ def _resolve_review_doc_url(review_id: str, headers: dict) -> str:
         resp = s.get(url, headers=headers, timeout=6)
         if resp.status_code == 200:
             mp_info = resp.json().get("review", {}).get("mpInfo", {})
-            orig_id = mp_info.get("originalId", "")
-            if orig_id and len(orig_id) >= 15:
-                doc_url = f"https://mp.weixin.qq.com/s/{orig_id}"
-            else:
-                doc_url = mp_info.get("doc_url", "")
+            doc_url = (mp_info.get("doc_url") or
+                       short_link_from_review_id(f"MP_WXS_0_{mp_info.get('originalId', '')}"))
             if doc_url:
                 with _review_cache_lock:
                     _review_url_cache[review_id] = doc_url
@@ -269,10 +266,6 @@ def _fetch_articles_page(fakeid: str, begin: int, count: int, keyword: str = "",
         import concurrent.futures
         def _get_url(it):
             rid = it.get("reviewId", "")
-            if rid and "_" in rid:
-                sid = rid.split("_")[-1]
-                if len(sid) >= 15:
-                    return f"https://mp.weixin.qq.com/s/{sid}"
             doc_u = it.get("mpInfo", {}).get("doc_url", "")
             if doc_u:
                 return doc_u
@@ -528,7 +521,7 @@ def download_by_url():
     if not extracted_urls:
         return jsonify({"error": "未检测到有效的微信公众号文章链接"}), 400
 
-    # 批量将长链接预解析为免风控的标准短链与 reviewId
+    # 批量解析长链接对应的候选短链与 reviewId
     url_info_map = {}
     long_urls_to_resolve = [u for u in extracted_urls if "__biz=" in u]
     if long_urls_to_resolve:
@@ -540,13 +533,9 @@ def download_by_url():
             for r_item in res.get("reviewIds", []):
                 orig_u = r_item.get("url", "")
                 rid = r_item.get("reviewId", "")
-                if rid and "_" in rid:
-                    sid = rid.split("_")[-1]
-                    if len(sid) >= 15:
-                        url_info_map[orig_u] = {
-                            "short_url": f"https://mp.weixin.qq.com/s/{sid}",
-                            "review_id": rid,
-                        }
+                short_url = short_link_from_review_id(rid)
+                if short_url:
+                    url_info_map[orig_u] = {"short_url": short_url, "review_id": rid}
         except Exception as e:
             logger.debug(f"[download_by_url] 批量预解析短链异常: {e}")
 
