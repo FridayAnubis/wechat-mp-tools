@@ -2,11 +2,8 @@ name: Build WeChat MP Tools Executables
 
 on:
   push:
-    branches:
-      - main
-      - master
     tags:
-      - '*'
+      - 'v*'
   workflow_dispatch: # 支持在 GitHub 页面上点击按钮手动触发打包
 
 jobs:
