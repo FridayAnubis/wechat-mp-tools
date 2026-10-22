@@ -83,6 +83,7 @@ hiddenimports = [
     'backend.weread_signer',
     'backend.articles',
     'backend.rss_feed',
+    'backend.avatar_cache',
     'backend.content_filter',
     'backend.proxy',
     'backend.douyin',
