@@ -29,7 +29,7 @@ from urllib.parse import quote
 
 from flask import Response
 
-from backend.avatar_cache import article_avatar, cache_avatar
+from backend.avatar_cache import article_avatar, avatar_account_ids, cache_avatar
 from backend.config import (
     ACCOUNTS_FILE,
     DATA_DIR,
@@ -68,29 +68,43 @@ def _file_mtimes() -> tuple:
 
 def get_account_avatar(account: str, items: list | None = None,
                        from_article: bool = True) -> str:
-    """优先使用账号头像，缺失时从本地元数据及最近文章补全。"""
+    """仅使用能确认归属的头像；昵称有歧义时省略头像。"""
     accounts = load_json(ACCOUNTS_FILE, [])
-    for item in accounts if isinstance(accounts, list) else []:
-        if not isinstance(item, dict):
-            continue
-        if item.get("nickname") == account:
-            avatar = str(item.get("round_head_img") or "").strip()
-            if avatar.startswith(("https://", "http://")):
-                return avatar
+    matches = [item for item in (accounts if isinstance(accounts, list) else [])
+               if isinstance(item, dict) and item.get("nickname") == account]
+    identities = [avatar_account_ids(item) for item in matches]
+    account_ids = set().union(*identities)
+    # 现有 RSS 地址以昵称定位，不能替同名的不同账号任意选一张头像。
+    if len(account_ids) != 1 or any(ids != account_ids for ids in identities):
+        return ""
+    for item in matches:
+        avatar = str(item.get("round_head_img") or "").strip()
+        if avatar.startswith(("https://", "http://")):
+            return avatar
     if not from_article:
         return ""
-    candidates = (items or [])[:3]
+    account_id = next(iter(account_ids))
+    candidates = []
+    for item in items or []:
+        item_ids = avatar_account_ids(item)
+        if item.get("account") == account and (not item_ids or item_ids == {account_id}):
+            candidates.append(item)
+            if len(candidates) == 3:
+                break
     for item in candidates:
         if not item.get("path"):
             continue
         metadata = load_json(Path(item["path"]) / "metadata.json", {})
-        if isinstance(metadata, dict):
+        if (isinstance(metadata, dict) and avatar_account_ids(metadata) == {account_id}
+                and (not metadata.get("source") or metadata["source"] == account)
+                and (not metadata.get("url") or not item.get("link")
+                     or normalize_wechat_url(metadata["url"]) == normalize_wechat_url(item["link"]))):
             avatar = str(metadata.get("round_head_img") or "").strip()
             if avatar.startswith(("https://", "http://")):
                 return avatar
     for item in candidates:
         if item.get("link"):
-            avatar = article_avatar(item["link"])
+            avatar = article_avatar(item["link"], account_id)
             if avatar:
                 return avatar
     return ""
