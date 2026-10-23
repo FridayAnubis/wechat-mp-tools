@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import base64
+import binascii
 import hashlib
 import html
 import ipaddress
@@ -12,7 +14,7 @@ import tempfile
 import threading
 import time
 from html.parser import HTMLParser
-from urllib.parse import urljoin, urlsplit
+from urllib.parse import parse_qs, unquote, urljoin, urlsplit
 
 import requests
 from flask import abort, send_from_directory
@@ -30,6 +32,49 @@ _locks = [threading.Lock() for _ in range(16)]
 _failures: dict[str, float] = {}
 _article_avatars: dict[str, str] = {}
 _state_lock = threading.Lock()
+
+
+def normalize_avatar_account_id(value: str) -> str:
+    """统一头像归属使用的 fakeid、__biz 和微信读书 bookId。"""
+    value = unquote(str(value or "")).strip()
+    if not value or "${" in value:
+        return ""
+    if value.startswith("MP_WXS_"):
+        return value
+    if value.isascii() and value.isdigit():
+        return "MP_WXS_" + value
+    try:
+        decoded = base64.b64decode(value + "=" * (-len(value) % 4), validate=True).decode("ascii")
+        if decoded.isdigit():
+            return "MP_WXS_" + decoded
+    except (ValueError, UnicodeError, binascii.Error):
+        pass
+    return value
+
+
+def avatar_account_ids(record: dict) -> set[str]:
+    """保留所有归属证据，避免一个匹配字段掩盖另一个冲突字段。"""
+    ids = {normalize_avatar_account_id(record.get(key))
+           for key in ("avatar_account_id", "fakeid", "bookId", "biz", "__biz")
+           if record.get(key)}
+    for key in ("url", "link"):
+        url = html.unescape(str(record.get(key) or "")).split("#", 1)[0]
+        if _allowed_url(url, article=True):
+            ids.update(normalize_avatar_account_id(value)
+                       for value in parse_qs(urlsplit(url).query).get("__biz", []))
+    return ids - {""}
+
+
+def extract_avatar_account_id(page: str) -> str:
+    """读取文章页自身的 biz 变量，不从正文中的其他文章链接推断归属。"""
+    ids = set()
+    for value in re.findall(r'''\b(?:biz|__biz)["']?\s*(?:=|:)\s*(["'])(.*?)\1''', page):
+        identity = re.sub(r"\\x([0-9a-fA-F]{2})|\\u([0-9a-fA-F]{4})",
+                          lambda m: chr(int(m.group(1) or m.group(2), 16)), value[1])
+        identity = normalize_avatar_account_id(html.unescape(identity))
+        if re.fullmatch(r"MP_WXS_[0-9]+", identity):
+            ids.add(identity)
+    return ids.pop() if len(ids) == 1 else ""
 
 
 def _allowed_url(url: str, article: bool = False) -> bool:
@@ -205,11 +250,14 @@ def extract_account_avatar(page: str) -> str:
     return avatar if _allowed_url(avatar) else ""
 
 
-def article_avatar(url: str) -> str:
-    """为旧数据从最近文章补全头像；失败十分钟内不重试。"""
-    if not _allowed_url(url, article=True):
+def article_avatar(url: str, account_id: str) -> str:
+    """仅从归属匹配的文章页补全头像；失败十分钟内不重试。"""
+    account_id = normalize_avatar_account_id(account_id)
+    link_ids = avatar_account_ids({"url": url})
+    if (not account_id or not _allowed_url(url, article=True)
+            or (link_ids and link_ids != {account_id})):
         return ""
-    key = "article:" + hashlib.sha256(url.encode("utf-8")).hexdigest()
+    key = "article:" + hashlib.sha256((account_id + "\0" + url).encode("utf-8")).hexdigest()
     with _locks[int(key[-2:], 16) % len(_locks)]:
         with _state_lock:
             cached = _article_avatars.get(key)
@@ -219,7 +267,8 @@ def article_avatar(url: str) -> str:
             return ""
         try:
             data, _ = _fetch(url, article=True)
-            avatar = extract_account_avatar(data.decode("utf-8", errors="replace"))
+            page = data.decode("utf-8", errors="replace")
+            avatar = extract_account_avatar(page) if extract_avatar_account_id(page) == account_id else ""
             if avatar:
                 with _state_lock:
                     if len(_article_avatars) >= 512:
