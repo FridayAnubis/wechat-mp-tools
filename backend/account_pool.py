@@ -218,7 +218,7 @@ class AccountPool:
                 return
 
             # 处理 401 认证过期 / 显式请求刷新
-            if status_code == 401 or ret in (401, -2012) or need_refresh:
+            if status_code == 401 or ret in (401, -2001, -2002) or need_refresh:
                 logger.info("账号 [%s] 认证过期，正在执行自动静默续期...", acc.get("nickname"))
                 refreshed = self._refresh_account_locked(acc)
                 if refreshed:
@@ -254,10 +254,17 @@ class AccountPool:
                 except Exception as ex:
                     logger.debug("自动激活异常: %s", ex)
 
-            # 处理频控或风控 (如 429 或限流或 499 临时抖动)
+            # 处理频控或风控 (如 -2014 瞬时频控、429 或 499 临时限频)
+            if ret == -2014 or "-2014" in str(error_msg or ""):
+                acc["status"] = "cooldown"
+                acc["cooldown_until"] = now + 30.0  # -2014 瞬时并发过高，轻量冷却 30 秒自愈
+                acc["last_error"] = error_msg or "网关瞬时频控 (-2014)，冷却 30 秒自动恢复"
+                self._save(accounts)
+                return
+
             if status_code in (429, 403, 499) or ret in (200013, -2013, -2041):
                 acc["status"] = "cooldown"
-                acc["cooldown_until"] = now + 120.0  # 临时冷却 120 秒后自动恢复
+                acc["cooldown_until"] = now + 60.0  # 临时冷却 60 秒后自动恢复
                 acc["last_error"] = error_msg or f"请求频控或连接异常 (HTTP {status_code})，临时冷却"
                 self._save(accounts)
                 return

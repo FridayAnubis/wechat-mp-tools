@@ -101,8 +101,8 @@ const SettingsPage = {
                     </div>
                 </div>
 
-                <!-- 视频号解析配置 -->
-                <div class="card">
+                <!-- 视频号解析配置（公众号版由 mp-mode.js 隐藏） -->
+                <div class="card" data-mp-hide>
                     <div class="card-header">
                         <h3 class="card-title">🟢 视频号服务配置</h3>
                     </div>
@@ -115,8 +115,8 @@ const SettingsPage = {
                     </div>
                 </div>
 
-                <!-- 微信读书中转服务配置 -->
-                <div class="card">
+                <!-- 微信读书中转服务配置（公众号版直连官方，由 mp-mode.js 隐藏） -->
+                <div class="card" data-mp-hide>
                     <div class="card-header">
                         <h3 class="card-title">📖 微信读书中转服务配置</h3>
                     </div>
@@ -129,8 +129,8 @@ const SettingsPage = {
                     </div>
                 </div>
 
-                <!-- B站下载配置 -->
-                <div class="card">
+                <!-- B站下载配置（公众号版由 mp-mode.js 隐藏） -->
+                <div class="card" data-mp-hide>
                     <div class="card-header">
                         <h3 class="card-title">📺 Bilibili 下载配置</h3>
                     </div>

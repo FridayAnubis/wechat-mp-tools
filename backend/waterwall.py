@@ -1,6 +1,6 @@
 """
 腾讯防水墙 (TCaptcha) 拦截识别、安全凭证同步与失败取证模块
-逆向自微信读书 APK 官方风控交互机制 (AppID: 2044038556)
+基于微信读书官方客户端风控交互机制实现
 """
 
 import time
@@ -22,6 +22,7 @@ WATERWALL_MARKERS = (
     "请完成验证",
     "risk_control",
     "verify_code",
+    "-2041",
 )
 
 WATERWALL = {
@@ -56,13 +57,13 @@ SENSITIVE_KEYS = (
 )
 
 VERDICT_HINTS = {
-    "captcha": "腾讯防水墙：需要人工验证。工具已停止自动重试，页面已拉起验证码弹窗，滑动验证后即可自动恢复。",
-    "session_inactive": "终端会话休眠（499 / -2041），非验证码。工具会自动调用 mobileSync 激活在线态并轮换账号。",
-    "auth_expired": "登录态过期（401）。账号池已自动触发静默续期。",
-    "rate_limited": "被上游限流（429）。请适当降频或稍后再试。",
-    "forbidden": "403 禁止访问，可能为权限受限或风控静默拒绝。",
-    "server_error": "微信读书官方服务器错误（5xx）。",
-    "other": "其他未知异常，请查看响应详细特征。",
+    "captcha": "腾讯防水墙：需要人工验证。工具已停止自动重试，请完成网页滑块验证或在手机 App 开启阅读后重试。",
+    "session_inactive": "终端会话休眠（499 / -2041），非验证码。工具会自动尝试 mobileSync 激活在线态重试；若反复出现，需在微信读书 App 中打开任意公众号主页激活。",
+    "auth_expired": "登录态过期（401）。账号池已自动触发静默换票续期。",
+    "rate_limited": "被微信读书网关限流（-2014 / 429）。工具已自动退避降频重试，请勿瞬间连续高频请求。",
+    "forbidden": "403 禁止访问，可能为账号权限受限或风控静默拒绝。",
+    "server_error": "微信读书官方服务器错误（5xx），稍后重试即可。",
+    "other": "未归类的异常，请查看响应详细特征与 body_head。",
 }
 
 
@@ -183,18 +184,19 @@ def _mask_body(body: str) -> str:
     return txt
 
 
-def classify_failure(status: int, body: str, marker: str) -> str:
+def classify_failure(status: int, body: str, marker: str = "") -> str:
     if marker:
         return "captcha"
-    if status == 499 or "-2041" in body:
-        return "session_inactive"
+    b_str = body or ""
     if status == 401:
         return "auth_expired"
-    if status == 429:
+    if "-2014" in b_str or status == 429:
         return "rate_limited"
+    if status == 499 or "-2041" in b_str:
+        return "session_inactive"
     if status == 403:
         return "forbidden"
-    if status >= 500:
+    if 500 <= status < 600:
         return "server_error"
     return "other"
 

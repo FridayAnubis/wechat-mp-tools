@@ -33,6 +33,7 @@
 | 15 | `frontend/history.js` 用 `display_path`、支持 `url` | 无 | 两者都有 `||` 兜底 | 显示与原来一致 |
 | 16 | `requirements.txt` 加 `beautifulsoup4` | 无 | 纯新增依赖；`articles.py` 里本来就 `import bs4` | 已装 4.15.0 |
 | 17 | `wechat_mp_tools.spec` 加 4 个 hiddenimports | 无 | 只影响打包收集 | 见第五节 |
+| 18 | `settings.js` 给 3 张卡片加 `data-mp-hide`；`mp-mode.js` 注入隐藏规则 | 无 | 只在 `body.mp-only` 下生效，桌面不会加这个 class | 桌面 6 张卡片全在（截图） |
 
 ## 三、唯一的行为变化：RSS 条数
 

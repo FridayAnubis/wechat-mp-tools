@@ -57,7 +57,7 @@ INSTALL_BROWSERS=1
 
 1. **只有 RSS 需要 7×24 常驻。** 抖音/小红书那些是「点一下、拿文件」的交互式工具，跑在服务器上，下载完还得想办法把文件取回来，收益不高。
 2. **依赖面直接决定长期稳定性。** 完整 `requirements.txt` 里为了绕开 mitmproxy 的 `typing-extensions` 冲突专门钉了 `typing-extensions==4.14.0`，这类版本锁在无人值守的服务器上最容易变成「某天重启就起不来」。公众号链路只用 6 个包，冲突面小得多。
-3. **视频号本来就部署不了。** 它靠 mitmproxy 拦截**本机微信客户端**的流量，容器里没有微信，全功能版也补不齐这块。与其留个跑不动的入口，不如把边界划清楚。
+3. **视频号的登录方式不适合容器。** 解析和下载本身是纯 HTTP（腾讯元宝接口 / 私有 Worker + 内置 ISAAC64 解密），容器里能跑；卡点在拿元宝 Cookie 那一步——它用 `headless=False` 开一个**可见浏览器**让你扫码，容器没有显示器。剩下的只有「手动粘 Cookie」（会过期）和「公共 Worker」（第三方，随时可能挂）两条降级路。与其留个半残入口，不如把边界划清楚。
 
 但全功能版确实有用武之地（比如在 NAS 上批量下抖音），所以保留，一条配置切换。
 
@@ -87,11 +87,39 @@ docker compose up -d --build
 | 账号池 | `backend/account_pool.py` | ✅ | ✅ |
 | 代理配置 | `backend/proxy.py` | ✅ | ✅ |
 | RSS 定时抓取 | `backend/rss_scheduler.py` | ✅ | ✅ |
-| 抖音 / 快手 / 小红书 / B 站 | `backend/{douyin,kuaishou,xiaohongshu,bilibili}*.py` | ❌ | ✅ |
-| 转码 / 字幕擦除 | `backend/transcode.py`、`subtitle_remover/` | ❌ | ✅ |
-| 微信视频号 | `backend/channels.py` + `mitm_proxy.py` | ❌ | ❌ 需本机微信 |
-| 打开文件夹 / 文件 | `backend/articles.py` 相关路由 | ❌ | ❌ 无桌面 |
-| 客户端自动更新 | `backend/updater.py` | ❌ | ❌ 应换镜像 |
+| 内容过滤 | `backend/content_filter.py` | ✅ | ✅ |
+| 抖音 / 快手 / 小红书 / B 站 | `backend/{douyin,kuaishou,xiaohongshu,bilibili}*.py` | ⛔ 构建时删除 | ✅ |
+| 转码 / 字幕擦除 | `backend/transcode.py`、`subtitle_remover/` | ⛔ 构建时删除 | ✅ |
+| 微信视频号 | `backend/channels.py` + `mitm_proxy.py` | ⛔ 构建时删除 | ⚠️ 仅手动 Cookie |
+| 客户端自动更新 | `backend/updater.py` | ⛔ 构建时删除 | ✅ |
+| 打开文件夹 / 文件 | `backend/articles.py` 相关路由 | ⚠️ 降级为宿主机路径提示 | ✅ |
+
+### 公众号版到底删掉了哪些文件
+
+`deploy/docker/Dockerfile` 先用一个 `backend-src` 阶段裁剪，再 `COPY --from` 进最终镜像。
+
+**不是 `RUN rm`**——那只会在上层标记删除，文件仍留在 `COPY` 那一层，解包镜像还能捞出来。用独立阶段才是真的没有。
+
+最终镜像 `/app/backend` 只剩 **18 个 .py**：
+
+```
+__init__ account_pool account_pool_api accounts articles auth avatar_cache config
+content_filter downloader proxy request_profile rss_feed rss_scheduler runtime
+waterwall wechat_url weread_signer
+```
+
+删掉的 21 个：
+
+```
+channels mitm_proxy douyin douyin_auth douyin_login douyin_mstoken douyin_sign
+kuaishou kuaishou_auth xiaohongshu xiaohongshu_login bilibili bilibili_login
+bilibili_sign transcode updater weread_browser cred_redact proxy_worker
+refresh_queue sign
+```
+
+删除是安全的：用 AST 解析过 import 图，从 `app_mp.py` 出发能到达的模块里，
+没有任何一个 import 这些被删的模块（它们只互相引用）。删完实测健康检查、RSS、
+历史、内容过滤、首页全部正常。
 
 ### 各平台到底用什么方式下载
 
@@ -105,7 +133,7 @@ docker compose up -d --build
 | 快手 | `requests` | `requests` 流式 + `Range` 断点续传 | 无 |
 | 小红书 | `curl_cffi`（模拟 TLS 指纹） | `requests` 流式 | 无 |
 | B 站 | `requests`（`BilibiliClient`） | `requests` + **ffmpeg** 音视频混流 | **ffmpeg** |
-| 微信视频号 | mitmproxy 抓包 | 抓包得到的直链 | 本机微信客户端（不可容器化） |
+| 微信视频号 | 腾讯元宝接口 / 私有 Worker（纯 HTTP） | `requests` + 内置 ISAAC64 解密 | 无（但扫码登录需可见浏览器，容器里做不了） |
 
 结论：**真正下载视频/图片走的是 HTTP 流式请求，不是浏览器**。Chromium 只在四个地方用到：PDF 导出、微信风控兜底、各平台扫码登录、需要渲染的页面解析。所以不装 Chromium 时，公众号抓取与 RSS 完全不受影响。
 
@@ -158,6 +186,21 @@ RSS 支持 `?limit=` `?offset=` `?full=0` `?token=`，响应带 `ETag` / `Cache-
 - `mode === 'mp-only'` 时隐藏未打包模块的导航项，并收起空掉的分组
 - 直接输地址访问 `#dy_user` 这类页面会被重定向回文章页
 - 桌面版没有这个接口（返回的是 index.html，content-type 不是 json），脚本自动跳过，**桌面行为完全不变**
+
+### 设置页也会收窄
+
+带 `data-mp-hide` 标记的卡片只在公众号版隐藏，实现方式是注入一条
+`body.mp-only [data-mp-hide]{display:none}` 的 CSS 规则，而不是遍历 DOM——
+设置页是路由懒渲染的，可能晚于 capabilities 返回才出现，CSS 能覆盖到后渲染的节点。
+
+| 被隐藏的卡片 | 原因 |
+|---|---|
+| 🟢 视频号服务配置 | `channels` 模块在构建时已从镜像删除，Worker 域名填了也没人读 |
+| 📖 微信读书中转服务配置 | 全仓没有后端代码读取该设置（直连官方接口） |
+| 📺 Bilibili 下载配置 | `bilibili` 模块没打包 |
+
+保留的三张（下载与存储 / 抓取与防封 / RSS 订阅时间段）在公众号版都是真实生效的，
+其中 RSS 定时采集由 `app_mp.py` 里的 `rss_scheduler.start()` 驱动。
 
 ## 七、安全：应用本身没有登录
 

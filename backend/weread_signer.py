@@ -1,5 +1,5 @@
 """
-微信读书 libencrypt.so 纯 Python 算法逆向还原
+微信读书加签算法纯 Python 实现
 实现 weread::GenSignature 与 nativeGetSignatures 完整算法
 支持长效 Token (refreshToken) 自动换取最新 accessToken
 """
@@ -190,7 +190,7 @@ def try_refresh_session(session_path: str = ".session.json", device_id: str = No
 
 def activate_terminal_session(headers: dict, session=None) -> bool:
     """
-    通过逆向微信读书 APK (AppService.mobileSync) 确定的移动端在线会话激活步骤:
+    通过微信读书移动端在线会话同步协议 (AppService.mobileSync) 确定的激活步骤:
     向微信读书服务端发起 POST /mobileSync 汇报移动终端同步态，
     将新旧账号的服务端会话通道从未激活态转变为在线活跃态，彻底解除 /mp/chapters 和 store/search 的 499 (-2041) 拦截。
     """

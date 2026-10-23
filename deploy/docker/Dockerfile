@@ -1,7 +1,7 @@
 #
 # 只打包「公众号 + RSS」的独立服务（入口 app_mp.py）。
-# 抖音 / 快手 / 小红书 / B 站 / 视频号 / 转码 / 桌面壳 都不进镜像，
-# 依赖从 12 个降到 6 个。应用代码只有 4 MB，镜像的绝大部分是 Python 运行时。
+# 抖音 / 快手 / 小红书 / B 站 / 视频号 / 转码 / 桌面壳 的代码在构建阶段就被删掉，
+# 最终镜像里根本不存在这些文件；依赖从 12 个降到 6 个。
 #
 # 实测体积（arm64）：
 #   默认（无浏览器）解压 244 MB / 拉取 51 MB
@@ -12,6 +12,26 @@
 #
 # 需要 PDF 导出时才装浏览器（+1.7 GB，换来 PDF 与风控兜底）：
 #   docker build -f deploy/docker/Dockerfile --build-arg INSTALL_BROWSERS=1 -t wechat-mp-tools-mp:pdf .
+
+# ── 阶段 1：裁剪 backend ──────────────────────────────────────────────
+# 公众号版用不到的模块在这里删掉，最终镜像里不存在。
+# 不用「主镜像里 RUN rm」是因为那只会在上层标记删除，文件仍留在 COPY 那一层，
+# 解包镜像还能捞出来；用独立阶段 + COPY --from 才是真的没有。
+FROM python:3.12-slim AS backend-src
+WORKDIR /src
+COPY backend ./backend
+RUN rm -f \
+        backend/channels.py backend/mitm_proxy.py \
+        backend/douyin.py backend/douyin_auth.py backend/douyin_login.py \
+        backend/douyin_mstoken.py backend/douyin_sign.py \
+        backend/kuaishou.py backend/kuaishou_auth.py \
+        backend/xiaohongshu.py backend/xiaohongshu_login.py \
+        backend/bilibili.py backend/bilibili_login.py backend/bilibili_sign.py \
+        backend/transcode.py backend/updater.py backend/weread_browser.py \
+        backend/cred_redact.py backend/proxy_worker.py backend/refresh_queue.py \
+        backend/sign.py \
+    && find backend -name '__pycache__' -type d -prune -exec rm -rf {} + \
+    && echo "保留模块 $(ls backend/*.py | wc -l) 个"
 
 FROM python:3.12-slim
 
@@ -62,7 +82,8 @@ RUN if [ "$INSTALL_BROWSERS" = "1" ]; then \
     fi
 
 COPY app_mp.py ./
-COPY backend ./backend
+# 从裁剪阶段拿 backend，镜像里不含抖音/快手/小红书/B站/视频号等模块
+COPY --from=backend-src /src/backend ./backend
 COPY frontend ./frontend
 
 COPY deploy/docker/entrypoint.sh /usr/local/bin/entrypoint.sh

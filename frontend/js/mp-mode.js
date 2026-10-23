@@ -55,6 +55,24 @@
         if (sub) sub.textContent = '公众号订阅服务';
     }
 
+    /**
+     * 隐藏只对全功能版有意义的设置项（如视频号 Worker、微信读书中转）。
+     *
+     * 用注入 CSS 的方式，而不是直接遍历 DOM：
+     * 设置页是路由懒渲染的，页面可能在 capabilities 返回之后才渲染出来，
+     * 靠 CSS 选择器能覆盖到之后才出现的节点。
+     */
+    function applyHiddenBlocks() {
+        document.body.classList.add('mp-only');
+
+        if (document.getElementById('mp-mode-style')) return;
+        var style = document.createElement('style');
+        style.id = 'mp-mode-style';
+        style.textContent =
+            'body.mp-only [data-mp-hide]{display:none !important;}';
+        document.head.appendChild(style);
+    }
+
     function guardHash() {
         var key = (window.location.hash.slice(1) || 'login').split('?')[0];
         if (ALLOWED.indexOf(key) === -1) {
@@ -77,6 +95,7 @@
 
             applyNav();
             applyBranding();
+            applyHiddenBlocks();
             guardHash();
             window.addEventListener('hashchange', guardHash);
 

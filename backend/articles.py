@@ -123,7 +123,12 @@ def _fetch_articles_page(fakeid: str, begin: int, count: int, keyword: str = "",
     s = get_weread_session()
 
     def _do_get(url: str):
-        """内部请求函数：遇到 401 自动静默续期并重试，遇到 499 自动标记频控并尝试轮询账号池下一账号"""
+        """内部请求函数：对齐官方 SyncKeyRequestFeature 与 WRRetryHandler 错误码自愈策略"""
+        req_url = url
+        # 遵循 APK SyncKeyRequestFeature: 同步型接口自动补全 synckey=0 规避 499 拒止
+        if any(k in req_url for k in ("/mp/chapters", "/mp/list", "/shelf/sync", "/subscription/books")) and "synckey=" not in req_url:
+            req_url = f"{req_url}&synckey=0" if "?" in req_url else f"{req_url}?synckey=0"
+
         last_resp = None
         last_h = None
         last_acc = None
@@ -135,23 +140,26 @@ def _fetch_articles_page(fakeid: str, begin: int, count: int, keyword: str = "",
             last_h = h
             last_acc = acc_id
             try:
-                r = s.get(url, headers=h, timeout=10)
+                r = s.get(req_url, headers=h, timeout=10)
                 last_resp = r
 
                 # ── 优先检测腾讯防水墙 (TCaptcha) ──
                 from backend.waterwall import detect_waterwall, waterwall_hit, record_failure
                 ww_marker = detect_waterwall(r.status_code, r.text)
                 if ww_marker:
-                    record_failure(url, r.status_code, r.headers, r.text, ww_marker)
-                    waterwall_hit(url, r.status_code, ww_marker)
+                    record_failure(req_url, r.status_code, r.headers, r.text, ww_marker)
+                    waterwall_hit(req_url, r.status_code, ww_marker)
                     return r, h, acc_id
 
+                # 401 Token 过期: 自动静默续期重试
                 if r.status_code == 401:
                     print(f"[_fetch_articles_page] 微信读书 401 Token 过期，触发自动静默续期 (第 {att+1} 次)...", flush=True)
                     account_pool.report(acc_id, status_code=401)
                     time.sleep(0.5)
                     continue
-                if r.status_code == 499:
+
+                # 429 或 499: 精准匹配官方错误码 (对齐 OverFreqInterceptor 与 WRRetryHandler 策略)
+                if r.status_code in (429, 499):
                     err_json = {}
                     try:
                         err_json = r.json()
@@ -159,22 +167,52 @@ def _fetch_articles_page(fakeid: str, begin: int, count: int, keyword: str = "",
                         pass
                     err_c = err_json.get("errcode")
                     err_m = str(err_json.get("errmsg") or "")
-                    if err_c == -2041 or "2041" in err_m:
-                        print(f"[_fetch_articles_page] 账号 [{acc_id}] 触发终端会话未激活 (-2041)，调用 activate_terminal_session 模拟真机同步...", flush=True)
+
+                    # 1. 微信读书频控 -2014 (OverFreqInterceptor): 短时间瞬时并发过高，自动退避 1.5 秒后降频重试
+                    if err_c == -2014 or "-2014" in r.text:
+                        print(f"[_fetch_articles_page] 触发微信读书网关频控 (-2014)，自动退避 1.5 秒后降频重试...", flush=True)
+                        time.sleep(1.5)
+                        try:
+                            r_retry = s.get(req_url, headers=h, timeout=10)
+                            if r_retry.status_code == 200:
+                                return r_retry, h, acc_id
+                        except Exception as ex_retry:
+                            logger.debug("频控退避重试网络异常: %s", ex_retry)
+
+                    # 2. 网关超时 -2012 (对齐 WRRetryHandler.canRetryTimeOut / whetherNeedToRetry 策略)
+                    elif err_c == -2012 or "-2012" in r.text:
+                        print(f"[_fetch_articles_page] 上游网关超时 (-2012)，遵循官方策略等待 0.5 秒自动重试...", flush=True)
+                        time.sleep(0.5)
+                        try:
+                            r_retry = s.get(req_url, headers=h, timeout=10)
+                            if r_retry.status_code == 200:
+                                return r_retry, h, acc_id
+                        except Exception:
+                            pass
+
+                    # 3. 账号人机验证 / 终端同步态 -2041 (对齐 WRRetryHandler.canRetryAfterVerify 策略)
+                    elif err_c == -2041 or "2041" in r.text:
+                        print(f"[_fetch_articles_page] 账号 [{acc_id}] 触发终端会话在线态核验 (-2041)，调用 activate_terminal_session 模拟真机同步...", flush=True)
                         from backend.weread_signer import activate_terminal_session
                         if activate_terminal_session(h, session=s):
                             try:
-                                r_retry = s.get(url, headers=h, timeout=10)
+                                r_retry = s.get(req_url, headers=h, timeout=10)
                                 if r_retry.status_code == 200:
                                     print(f"[_fetch_articles_page] 账号 [{acc_id}] 移动端会话同步激活成功，重试请求通过！", flush=True)
                                     return r_retry, h, acc_id
                             except Exception as ex:
                                 logger.debug("重试请求异常: %s", ex)
-                        print(f"[_fetch_articles_page] 账号 [{acc_id}] 激活后仍受限，自动轮换账号池备用账号...", flush=True)
-                        account_pool.report(acc_id, status_code=499, ret=-2041, error_msg="微信读书需安全激活 (-2041)：请在手机微信读书App中打开任意公众号阅读一次以激活")
+
+                        # 若移动会话已激活但仍返回 -2041，确定触发官方 TCaptcha 人机验证，唤起前端滑块弹窗！
+                        print(f"[_fetch_articles_page] 账号 [{acc_id}] 移动会话已激活但仍返回 -2041，确认为官方强制 TCaptcha 人机验证！", flush=True)
+                        record_failure(req_url, r.status_code, r.headers, r.text, "-2041")
+                        waterwall_hit(req_url, r.status_code, "-2041")
+                        account_pool.report(acc_id, status_code=499, ret=-2041, error_msg="触发腾讯人机验证 (-2041)，需在网页完成滑块验证")
+                        return r, h, acc_id
                     else:
-                        print(f"[_fetch_articles_page] 账号 [{acc_id}] 遇到 499 频控限制 ({err_c} {err_m})，自动轮换账号池备用账号...", flush=True)
-                        account_pool.report(acc_id, status_code=499, ret=err_c, error_msg=f"请求频控 ({err_c} {err_m})，临时冷却 60 秒")
+                        print(f"[_fetch_articles_page] 账号 [{acc_id}] 遇到 499/429 限制 ({err_c} {err_m})，自动轮换账号池备用账号...", flush=True)
+                        account_pool.report(acc_id, status_code=r.status_code, ret=err_c, error_msg=f"请求频控 ({err_c} {err_m})，临时冷却")
+
                     # 频控后指数退避，避免轮换账号的瞬间形成密集重试
                     sleep_backoff(att + 1, base=0.4, cap=4.0)
                     continue
