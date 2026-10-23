@@ -10,7 +10,6 @@ import re
 import json
 import shutil
 import subprocess
-import requests
 import logging
 from pathlib import Path
 from datetime import datetime, timezone
@@ -23,6 +22,12 @@ from backend.config import (
 )
 from backend.wechat_url import normalize_wechat_short_url, short_id_from_review_id
 from backend.avatar_cache import extract_account_avatar, extract_avatar_account_id
+from backend.request_profile import (
+    SIGNATURE_WINDOW,
+    get_cdn_client,
+    get_data_client,
+    resolve_suffix_path,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -565,33 +570,48 @@ def normalize_url(url: str) -> str:
     return url
 
 
-def download_resource(url: str, path: Path) -> bool:
-    """下载单个资源文件"""
+def download_resource(url: str, path: Path) -> str | None:
+    """下载单个资源文件，返回实际落盘的文件名；失败返回 None。
+
+    三个约束：
+    1. 走独立 CDN 客户端 —— 不携带 Cookie、不发送 Referer，与数据会话完全隔离；
+    2. 先写 .part 临时文件，按文件头魔数确定后缀后原子改名，避免半截文件被当成成品；
+    3. 后缀以真实字节为准，不信任 Content-Type 与 URL 里的 wx_fmt 参数
+       （微信同一地址可能返回 jpg/png/webp，两者经常对不上）。
+    """
     proxy_url = None
+    part = path.with_name(path.name + ".part")
     try:
         proxies = get_proxies_dict()
-        if proxies:
-            proxy_url = proxies.get("http")
-        r = requests.get(
+        proxy_url = proxies.get("http") if proxies else None
+        r = get_cdn_client().get(
             url,
-            headers={
-                "Referer": "https://mp.weixin.qq.com/",
-                "User-Agent": DEFAULT_HEADERS["User-Agent"],
-            },
             proxies=proxies,
             timeout=60,
             stream=True,
         )
         r.raise_for_status()
         path.parent.mkdir(parents=True, exist_ok=True)
-        with open(path, "wb") as f:
-            for chunk in r.iter_content(8192):
+        head = b""
+        with open(part, "wb") as f:
+            for chunk in r.iter_content(65536):
+                if len(head) < SIGNATURE_WINDOW:
+                    head += chunk[: SIGNATURE_WINDOW - len(head)]
                 f.write(chunk)
+        if not head:
+            raise RuntimeError("响应内容为空")
+        final = resolve_suffix_path(path, head)
+        os.replace(part, final)
         report_proxy_status(proxy_url, success=True)
-        return True
+        return final.name
     except Exception:
+        try:
+            if part.exists():
+                part.unlink()
+        except OSError:
+            pass
         report_proxy_status(proxy_url, success=False)
-        return False
+        return None
 
 
 def find_mmbiz_urls(html: str) -> set:
@@ -964,10 +984,14 @@ def fetch_wechat_article_html(url: str, review_id: str = "") -> tuple[str, str, 
     proxy_url = proxies.get("http") if proxies else None
     http_error = ""
     headers = get_wechat_mobile_headers()
+    # 数据客户端只复用连接池；公众号页面本身不需要登录态，
+    # 每次请求前清空 CookieJar，避免会话在多次抓取之间被服务端种下的 Cookie 污染
+    client = get_data_client()
 
     for target_url in urls_to_try:
         try:
-            resp = requests.get(
+            client.cookies.clear()
+            resp = client.get(
                 target_url,
                 headers=headers,
                 proxies=proxies,
@@ -1205,8 +1229,9 @@ def download_single_article(url: str, out_dir: Path, title_hint: str = "", _redi
         if cover_url:
             cover_ext = get_ext(cover_url) or "jpg"
             cover_filename = f"cover.{cover_ext}"
-            if download_resource(cover_url, media_dir / cover_filename):
-                url_map[cover_url] = f"media/{cover_filename}"
+            real_cover = download_resource(cover_url, media_dir / cover_filename)
+            if real_cover:
+                url_map[cover_url] = f"media/{real_cover}"
 
         # 仅在文章正文 content_html 内提取图片，避免下载外部页眉、页脚、微信小图标等多余资源
         for m in re.finditer(r'data-src="([^"]*mmbiz[^"]*)"', content_html):
@@ -1222,8 +1247,9 @@ def download_single_article(url: str, out_dir: Path, title_hint: str = "", _redi
                 continue
             ext = get_ext(img_url)
             fname = f"img_{i:03d}.{ext}"
-            if download_resource(img_url, media_dir / fname):
-                url_map[img_url] = f"media/{fname}"
+            real_img = download_resource(img_url, media_dir / fname)
+            if real_img:
+                url_map[img_url] = f"media/{real_img}"
 
     # 下载视频
     if save_videos:
@@ -1249,7 +1275,9 @@ def download_single_article(url: str, out_dir: Path, title_hint: str = "", _redi
             ext = get_ext(vid_url) or "mp4"
             ext = get_video_ext(vid_url) if ext == "jpg" else ext
             fname = f"video_{i}.{ext}"
-            if download_resource(vid_url, media_dir / fname):
+            real_video = download_resource(vid_url, media_dir / fname)
+            if real_video:
+                fname = real_video
                 url_map[vid_url] = f"media/{fname}"
                 if video.get("src"):
                     url_map[video["src"]] = f"media/{fname}"
@@ -1257,9 +1285,10 @@ def download_single_article(url: str, out_dir: Path, title_hint: str = "", _redi
                 if save_images and video.get("cover"):
                     cover_ext = get_ext(video["cover"])
                     cover_name = f"video_cover_{i}.{cover_ext}"
-                    if download_resource(video["cover"], media_dir / cover_name):
-                        poster_attr = f' poster="media/{cover_name}"'
-                        url_map[video["cover"]] = f"media/{cover_name}"
+                    real_cover = download_resource(video["cover"], media_dir / cover_name)
+                    if real_cover:
+                        poster_attr = f' poster="media/{real_cover}"'
+                        url_map[video["cover"]] = f"media/{real_cover}"
                 url_map[f"__video_iframe__{video.get('vid', i)}"] = (
                     video,
                     f'<video controls src="media/{fname}"{poster_attr}></video>',

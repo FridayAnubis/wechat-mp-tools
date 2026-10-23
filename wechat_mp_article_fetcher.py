@@ -22,13 +22,13 @@ def ensure_virtualenv():
 ensure_virtualenv()
 
 import json
-import time
 import re
 from pathlib import Path
 from datetime import datetime
 from backend.account_pool import account_pool
 from backend.articles import _fetch_articles_page
 from backend.accounts import search_accounts
+from backend.request_profile import sleep_throttled
 
 # ============================================================
 #  ⚡ 配置区
@@ -39,6 +39,12 @@ TARGET_ACCOUNTS = {
 
 PAGE_SIZE    = 10    # 每次拉取篇数
 MAX_ARTICLES = 50    # 最多抓取篇数（0=不限制）
+
+# 翻页节流：真实值按对数正态分布采样，PAGE_DELAY 是数学期望而非固定间隔
+# 下沿固定 0.3s（不低于改造前的固定间隔），上沿 5×PAGE_DELAY，尾部偶发长等待更接近真人
+PAGE_DELAY   = 1.0   # 翻页间隔均值（秒）
+DELAY_SIGMA  = 0.6   # 对数正态的 sigma，越大长尾越明显（0 = 退化为固定间隔）
+PAGE_DELAY_MIN = 0.3 # 翻页间隔下沿（秒），保证不会比改造前更密
 
 SCRIPT_DIR  = Path(__file__).resolve().parent
 DATA_DIR    = SCRIPT_DIR / "data"
@@ -88,7 +94,7 @@ def fetch_all_articles(account_name: str, fakeid: str) -> list[dict]:
             break
 
         begin += len(page_articles)
-        time.sleep(0.3)
+        sleep_throttled(PAGE_DELAY, DELAY_SIGMA, min_delay=PAGE_DELAY_MIN)
 
     print(f"\n  ✅ [{account_name}] 共获取 {len(all_articles)} 篇文章")
     return all_articles
@@ -143,6 +149,7 @@ def main():
 
     print(f"   账号池状态: {len(active_accs)} 个可用账号 (主账号: {active_accs[0].get('nickname')})")
     print(f"   目标账号数: {len(TARGET_ACCOUNTS)}")
+    print(f"   节流策略  : 对数正态 均值 {PAGE_DELAY}s / 下沿 {PAGE_DELAY_MIN}s / 上沿 {PAGE_DELAY * 5:.1f}s")
     print(f"   输出目录  : {OUTPUT_DIR}\n")
 
     for account_name, fakeid in TARGET_ACCOUNTS.items():

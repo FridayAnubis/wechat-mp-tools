@@ -37,7 +37,12 @@ const API = {
                     }
                 }
                 if (showError) Toast.error(errMsg);
-                throw new Error(errMsg);
+                // 保留结构化错误码，便于调用方区分「未登录」「风控」等可引导的场景
+                const error = new Error(errMsg);
+                error.code = data.code || '';
+                error.status = resp.status;
+                error.data = data;
+                throw error;
             }
 
             return data;
@@ -285,8 +290,8 @@ const API = {
             saveCookie(c)   { return API.post('/api/xhs-auth/save-cookie', { cookie: c }); },
             logout()        { return API.post('/api/xhs-auth/logout'); },
         },
-        parse(url)                  { return API.post('/api/xhs/parse', { url }); },
-        download(urls)              { return API.post('/api/xhs/download', { urls }); },
+        parse(url, opts)            { return API.post('/api/xhs/parse', { url }, opts); },
+        download(urls, opts)        { return API.post('/api/xhs/download', { urls }, opts); },
         listAccounts()              { return API.get('/api/xhs/accounts'); },
         parseUser(url)              { return API.post('/api/xhs/accounts/parse', { url }); },
         addAccount(user)            { return API.post('/api/xhs/accounts', user); },

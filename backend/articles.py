@@ -27,6 +27,7 @@ from backend.account_pool import borrow_session, borrow_weread_session, account_
 from backend.accounts import biz_to_book_id
 from backend.wechat_url import normalize_wechat_short_url, short_id_from_review_id
 from backend.runtime import desktop_available, host_path_hint
+from backend.request_profile import sleep_backoff, sleep_throttled
 
 articles_bp = Blueprint("articles", __name__, url_prefix="/api/articles")
 
@@ -174,12 +175,13 @@ def _fetch_articles_page(fakeid: str, begin: int, count: int, keyword: str = "",
                     else:
                         print(f"[_fetch_articles_page] 账号 [{acc_id}] 遇到 499 频控限制 ({err_c} {err_m})，自动轮换账号池备用账号...", flush=True)
                         account_pool.report(acc_id, status_code=499, ret=err_c, error_msg=f"请求频控 ({err_c} {err_m})，临时冷却 60 秒")
-                    time.sleep(0.3)
+                    # 频控后指数退避，避免轮换账号的瞬间形成密集重试
+                    sleep_backoff(att + 1, base=0.4, cap=4.0)
                     continue
                 return r, h, acc_id
             except Exception as e:
                 logger.debug("[_fetch_articles_page] 网络异常: %s", e)
-                time.sleep(0.5)
+                sleep_backoff(att + 1, base=0.5, cap=4.0)
         return last_resp, last_h, last_acc
 
     articles = []
@@ -898,7 +900,9 @@ def _do_batch_download(task_id: str, articles: list, account_name: str):
                     error_msg = result.get("error", "未知错误")
                 except Exception as e:
                     error_msg = str(e)
-                time.sleep(1)
+                if attempt < max_retries:
+                    # 指数退避 + 抖动，避免失败后齐步重试形成尖峰
+                    sleep_backoff(attempt, base=1.0, cap=8.0)
 
             if result.get("title"):
                 title = result["title"]
@@ -940,8 +944,10 @@ def _do_batch_download(task_id: str, articles: list, account_name: str):
             })
 
             if i < len(articles) - 1:
-                import random
-                time.sleep(max(1.0, delay) + random.uniform(0.3, 1.2))
+                # 对数正态节流：均值与原实现 max(1.0, delay)+U(0.3,1.2) 的期望（约 1.75s）对齐，
+                # 只是把原本 1.3~2.2s 的窄带换成带长尾的分布；min_delay 抬住下沿，
+                # 保证没有任何一次间隔比原来的 1.3s 更密
+                sleep_throttled(max(1.0, delay) + 0.75, min_delay=1.3)
 
         # 保存历史
         save_json(DOWNLOAD_HISTORY_FILE, history)
@@ -994,7 +1000,7 @@ def _download_article_into_task(task_id: str, article: dict, account_name: str, 
     success = False
     error_msg = ""
     result = {}
-    for _ in range(max_retries):
+    for attempt in range(1, max_retries + 1):
         try:
             result = download_single_article(link, out_dir, title, review_id=review_id)
             if result.get("success"):
@@ -1003,7 +1009,9 @@ def _download_article_into_task(task_id: str, article: dict, account_name: str, 
             error_msg = result.get("error", "未知错误")
         except Exception as e:
             error_msg = str(e)
-        time.sleep(1)
+        if attempt < max_retries:
+            # 指数退避 + 抖动，避免失败后齐步重试形成尖峰
+            sleep_backoff(attempt, base=1.0, cap=8.0)
 
     if result.get("title"):
         title = result["title"]
@@ -1102,10 +1110,10 @@ def _do_range_download(
 
                 _download_article_into_task(task_id, article, account_name, history, downloaded_index)
                 downloaded_index += 1
-                # 增加防风控随机抖动延迟 (1.2s - 2.5s) 模拟人类请求
-                import random
-                sleep_time = max(1.0, delay) + random.uniform(0.3, 1.2)
-                time.sleep(sleep_time)
+                # 对数正态节流：均值与原实现 max(1.0, delay)+U(0.3,1.2) 的期望（约 1.75s）对齐，
+                # 只是把原本 1.3~2.2s 的窄带换成带长尾的分布；min_delay 抬住下沿，
+                # 保证没有任何一次间隔比原来的 1.3s 更密
+                sleep_throttled(max(1.0, delay) + 0.75, min_delay=1.3)
 
             # 当前页所有文章都早于 start_time，说明后续页也不会有范围内的文章了
             if out_of_range_count > 0 and out_of_range_count >= len(articles):

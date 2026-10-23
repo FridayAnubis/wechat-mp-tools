@@ -141,8 +141,9 @@ class TestMarkdownAndPDF(unittest.TestCase):
         self.assertIn("![](https://mmbiz.qpic.cn/gallery_01.jpg)", md)
         self.assertIn("这是一组珍贵的历史摄影作品。", md)
 
-    @patch("requests.get")
-    def test_download_single_article_generates_md_and_pdf(self, mock_get):
+    @patch("backend.downloader.get_cdn_client")
+    @patch("backend.downloader.get_data_client")
+    def test_download_single_article_generates_md_and_pdf(self, mock_data_client, mock_cdn_client):
         mock_response = MagicMock()
         mock_response.status_code = 200
         mock_response.content = (
@@ -155,11 +156,15 @@ class TestMarkdownAndPDF(unittest.TestCase):
             '</body></html>'
         ).encode("utf-8")
         mock_response.iter_content.return_value = [b"mock image data"]
-        mock_get.return_value = mock_response
+        # 请求统一走 request_profile 的两个 client，因此在 client 工厂处打桩；
+        # 直接 patch("requests.get") 已拦不到 Session.get，会让测试静默打真实网络
+        mock_data_client.return_value.get.return_value = mock_response
+        mock_cdn_client.return_value.get.return_value = mock_response
 
         out_dir = self.test_dir / "download_out"
         result = download_single_article("https://mp.weixin.qq.com/s/mock_article", out_dir, "端到端下载导出测试")
 
+        self.assertTrue(mock_data_client.return_value.get.called, "文章抓取必须走 data client")
         self.assertTrue(result["success"])
         art_path = Path(result["path"])
         self.assertTrue(art_path.exists())

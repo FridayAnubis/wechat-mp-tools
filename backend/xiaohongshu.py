@@ -51,10 +51,70 @@ def lognormal_sleep(avg_delay: float = 6.0, sigma: float = 0.6):
     time.sleep(wait_time)
 
 def clean_filename(filename: str) -> str:
-    """清理文件名，移除不支持的字符"""
-    filename = re.sub(r'[\\/:*?"<>|\n\r\t]', "", filename)
+    """清理文件名，移除不支持的字符。
+
+    空输入返回空串（不再返回 "untitled"）：调用方普遍写 `clean_filename(x) or 兜底`，
+    若这里返回 "untitled" 会把兜底吃掉，导致标题为空时文件名变成 untitled。
+    """
+    filename = re.sub(r'[\\/:*?"<>|\n\r\t]', "", filename or "")
     filename = filename.strip().replace(" ", "_")
-    return filename[:80] if filename else "untitled"
+    return filename[:80]
+
+
+class XhsLoginRequired(Exception):
+    """未登录或登录已失效：需要用户先完成小红书扫码登录。"""
+
+    def __init__(self, message: str = "未登录小红书，请先扫码登录后再试。", hint: str = ""):
+        super().__init__(message)
+        self.message = message
+        self.hint = hint or "登录后可获取无水印视频，以及博主笔记列表"
+
+
+_TOPIC_MARK_RE = re.compile(r"\[话题\]")
+_HASH_RE = re.compile(r"[#＃]+")
+
+# 实测带水印的 streamType：259（WEB_259，H.264 兼容版，烧录了动态水印）
+WATERMARKED_STREAM_TYPES = frozenset({259})
+
+
+def title_from_desc(desc: str, note_id: str = "") -> str:
+    """视频笔记的 title 普遍为空、文案都在 desc 里，且带 `#话题#[话题]#` 标记。
+
+    取首行、剥掉话题标记但保留话题文字，作为标题兜底；
+    例如 `#实话实说而已[话题]#` → `实话实说而已`。
+    """
+    text = (desc or "").strip()
+    first = text.splitlines()[0].strip() if text else ""
+    if not first:
+        return note_id or ""
+    cleaned = _TOPIC_MARK_RE.sub("", first)
+    cleaned = _HASH_RE.sub(" ", cleaned)
+    cleaned = re.sub(r"\s+", " ", cleaned).strip(" ，。,.!！?？:：;；、")
+    return cleaned[:40] or note_id or ""
+
+
+def is_watermarked_stream(stream: dict) -> bool:
+    """判断视频流是否带水印。
+
+    实测同一篇笔记（逐条下载后抽帧比对）：
+      · 258 / X264_MP4      h264  720x1280  → 无
+      · **259 / WEB_259**   h264  720x1280  → **有**（左上「小红书」logo + 右上昵称，位置会移动）
+      · 520 / WEB_520       hevc  720x1280  → 无
+      · 617 / WEB_618       hevc  1080x1920  → 无
+
+    所以 259 是小红书烧录了动态水印的 H.264 兼容版本。
+    特别注意：**不能按「H.264 优先」排序**，259 恰好是 H.264，
+    旧逻辑会把唯一带水印的版本排到第一位，这才是「下载的视频一直有水印」的真正原因。
+    """
+    if not isinstance(stream, dict):
+        return False
+    try:
+        if int(stream.get("streamType") or 0) in WATERMARKED_STREAM_TYPES:
+            return True
+    except (TypeError, ValueError):
+        pass
+    desc = str(stream.get("streamDesc") or "").upper()
+    return desc.endswith("259") or "WATERMARK" in desc
 
 def write_note_text(note_dir: Path, detail: dict) -> int:
     """把笔记文字内容写入 文案.txt（对应 XHS-Downloader 记录的作品标题/描述/标签/数据字段）。
@@ -172,6 +232,18 @@ class XhsClient:
         if cookie:
             headers["cookie"] = cookie.strip()
         return headers
+
+    def login_state(self) -> dict:
+        """探测当前 Cookie 的登录态。
+
+        返回 {logged_in, guest, user_id}；logged_in 为 None 表示无法判定
+        （未装 xhshow / 网络失败），调用方不应据此判定为游客。
+        任何异常都不向外抛，避免登录探测本身阻塞下载主流程。
+        """
+        try:
+            return check_xhs_login(get_settings().get("xhs_cookie", ""))
+        except Exception as e:
+            return {"logged_in": None, "guest": None, "user_id": "", "error": str(e)}
         
     def _request(self, url: str, method: str = "GET", retries: int = None, **kwargs) -> curl_requests.Response:
         if retries is None:
@@ -332,7 +404,15 @@ class XhsClient:
                 break
                 
         if not state_text:
-            if "login" in resp.url or "captcha" in html or "验证码" in html or "404?source=" in resp.url or "error_code=" in resp.url:
+            if "captcha" in html or "验证码" in html:
+                raise ValueError("触发小红书验证码拦截，请稍后重试或更新 Cookie。")
+            # 登录引导页同样不含 __INITIAL_STATE__，先判登录态，避免把「未登录」误报成「风控」
+            state_info = self.login_state()
+            if state_info.get("logged_in") is False:
+                raise XhsLoginRequired(
+                    "未登录小红书，该页面需要登录后才能访问。请先扫码登录小红书账号。"
+                )
+            if "login" in resp.url or "404?source=" in resp.url or "error_code=" in resp.url:
                 raise ValueError("触发风控或 Cookie 失效，请在登录页更新 Cookie。")
             raise ValueError("未在页面中找到 window.__INITIAL_STATE__，请检查链接或更新 Cookie。")
             
@@ -384,11 +464,20 @@ class XhsClient:
                 note = list(note_detail_map.values())[-1].get("note")
                 
         if not note:
+            # 先判登录态：未登录时小红书返回的是登录引导页，笼统报「风控/Cookie 失效」
+            # 会让用户以为工具坏了，实际只需要扫码登录
+            state_info = self.login_state()
+            if state_info.get("logged_in") is False:
+                raise XhsLoginRequired(
+                    "未登录小红书，该页面需要登录后才能查看。请先扫码登录小红书账号。"
+                )
             raise ValueError("触发风控或 Cookie 失效，请在登录页更新 Cookie。")
             
         note_id = note.get("noteId") or note.get("id", "")
-        title = note.get("title", "").strip()
         desc = note.get("desc", "").strip()
+        # 视频笔记普遍 title 为空、文案全在 desc；直接取 title 会得到空串，
+        # 下游 clean_filename 兜底后文件名变成 untitled，表现为「标题没有正常显示」
+        title = note.get("title", "").strip() or title_from_desc(desc, note_id)
         
         tag_list = note.get("tagList", [])
         tags = []
@@ -480,6 +569,7 @@ class XhsClient:
                 
         video = None
         video_candidates = []
+        video_watermarked = False      # True = 只能拿到带水印视频（通常是未登录）
         video_info = note.get("video") or note.get("media") or {}
         if isinstance(video_info, dict) and video_info:
             media = video_info.get("media", {}) if isinstance(video_info.get("media"), dict) else (video_info if "stream" in video_info else {})
@@ -495,18 +585,24 @@ class XhsClient:
 
             def stream_sort_key(s):
                 if not isinstance(s, dict):
-                    return (-1, 0, 0)
+                    return (-1, 0, 0, 0)
                 v_codec = str(s.get("videoCodec", "")).lower()
                 s_desc = str(s.get("streamDesc", "")).lower()
-                # 优先 H.264/AVC 编码（EF4 或包含 264），全设备与浏览器完美播放绝不黑屏
-                is_h264 = 1 if (v_codec in ("ef4", "h264", "avc", "avc1") or "264" in s_desc or s.get("streamType") == 259) else 0
+                # 第一优先级：无水印。259 是唯一烧录了动态水印的流，必须排最后
+                clean = 0 if is_watermarked_stream(s) else 1
+                # 第二优先级：分辨率（617 是 1080x1920，也是这里唯一无水印的高清版本）
                 res = float(s.get("height") or 0) * float(s.get("width") or 0) or float(s.get("height") or 0)
                 size = float(s.get("size") or s.get("videoBitrate") or 0)
-                return (is_h264, res, size)
+                # H.264 只作为末位 tiebreaker：它兼容性最好，但 259 恰好是 H.264，
+                # 一旦把编码提到分辨率前面，就会把带水印的版本选出来
+                is_h264 = 1 if (v_codec in ("ef4", "h264", "avc", "avc1") or "264" in s_desc) else 0
+                return (clean, res, size, is_h264)
 
             valid_streams = [s for s in all_streams if isinstance(s, dict)]
             if valid_streams:
                 valid_streams.sort(key=stream_sort_key, reverse=True)
+                # 所有候选都带水印时（极少见），标记出来交给上层提示用户
+                video_watermarked = all(is_watermarked_stream(s) for s in valid_streams)
                 for s in valid_streams:
                     master_url = s.get("masterUrl")
                     if master_url and master_url not in video_candidates:
@@ -520,12 +616,16 @@ class XhsClient:
                     if url_field and url_field not in video_candidates:
                         video_candidates.append(url_field)
 
+            # originVideoKey 是作者原始上传文件（无转码、无水印），优先级最高，必须排在流之前
             origin_key = video_info.get("consumer", {}).get("originVideoKey")
             if origin_key:
                 for host in ["sns-video-bd.xhscdn.com", "sns-video-al.xhscdn.com", "sns-video-hw.xhscdn.com", "sns-video-qc.xhscdn.com"]:
                     u = f"https://{host}/{origin_key}"
                     if u not in video_candidates:
                         video_candidates.append(u)
+                # 原始文件一定无水印，把它挪到最前面
+                video_candidates.sort(key=lambda x: 0 if origin_key in x else 1)
+                video_watermarked = False
 
             for k in ["masterUrl", "url", "videoUrl", "mainUrl"]:
                 u = video_info.get(k) or media.get(k)
@@ -568,6 +668,7 @@ class XhsClient:
             "lives": lives,
             "video": video,
             "video_candidates": video_candidates,
+            "video_watermarked": video_watermarked,
             "cover": cover
         }
 
@@ -1265,7 +1366,7 @@ def _do_xhs_download_thread(task_id: str, urls: list, account_name: str):
                 
         try:
             detail = client.get_note_detail(url)
-            author_nick = clean_filename(detail["author"]["nickname"])
+            author_nick = clean_filename(detail["author"]["nickname"]) or "未知博主"
             pub_date = detail["publish_time"].split()[0]
             clean_title = clean_filename(detail["title"]) or detail["note_id"]
             
@@ -1352,7 +1453,8 @@ def _do_xhs_download_thread(task_id: str, urls: list, account_name: str):
                         task["results"].append({
                             "title": detail["title"] or detail["note_id"],
                             "success": True,
-                            "path": str(note_dir)
+                            "path": str(note_dir),
+                            "watermarked": bool(detail.get("video_watermarked")),
                         })
                     else:
                         task["failed"] += 1
@@ -1371,19 +1473,25 @@ def _do_xhs_download_thread(task_id: str, urls: list, account_name: str):
                 "size": total_size,
                 "time": time.time(),
                 "success": success,
-                "error": error_msg
+                "error": error_msg,
+                "watermarked": bool(detail.get("video_watermarked")),
             })
             save_json(XHS_HISTORY_FILE, history)
             
         except Exception as e:
             err_str = str(e)
+            # 未登录单独标记，前端据此弹「去登录」而不是当成普通下载失败
+            need_login = isinstance(e, XhsLoginRequired)
             with _download_lock:
                 task = _download_tasks.get(task_id)
                 if task:
                     task["failed"] += 1
+                    if need_login:
+                        task["login_required"] = True
                     task["results"].append({
                         "title": f"Link_{idx + 1}",
                         "success": False,
+                        "login_required": need_login,
                         "error": err_str
                     })
                     
@@ -1396,6 +1504,7 @@ def _do_xhs_download_thread(task_id: str, urls: list, account_name: str):
                 "size": 0,
                 "time": time.time(),
                 "success": False,
+                "login_required": need_login,
                 "error": err_str
             })
             save_json(XHS_HISTORY_FILE, history)
@@ -1428,7 +1537,25 @@ def parse_url():
             return jsonify({"error": "未能从输入中提取到有效小红书链接，请确保包含explore或discovery链接"}), 400
         
         detail = client.get_note_detail(links[0])
+        # 未登录也能解析出数据，但只能拿到 720P 的 258 流；登录后才有 1080P 的 617 流
+        state_info = client.login_state()
+        need_login = state_info.get("logged_in") is False
+        detail["logged_in"] = state_info.get("logged_in")
+        detail["login_required"] = need_login
+        if detail.get("video_watermarked"):
+            detail["login_hint"] = "该笔记当前只提供带水印视频流，暂无可下载的无水印版本。"
+        elif need_login:
+            detail["login_hint"] = "未登录小红书：视频只能获取 720P 版本，登录后可下载 1080P 无水印视频。"
+        if need_login or detail.get("video_watermarked"):
+            detail["login_page"] = "xhs_login"
         return jsonify(detail)
+    except XhsLoginRequired as e:
+        return jsonify({
+            "error": str(e),
+            "code": "login_required",
+            "login_page": "xhs_login",
+            "hint": e.hint,
+        }), 401
     except Exception as e:
         return jsonify({"error": f"解析失败: {str(e)}"}), 500
 
@@ -1471,7 +1598,18 @@ def download_urls():
     )
     thread.start()
     
-    return jsonify({"task_id": task_id, "message": f"已启动下载任务，共 {len(extracted_urls)} 个链接", "count": len(extracted_urls)})
+    # 未登录不阻断下载，但必须明确告知：只会拿到带水印视频
+    payload = {
+        "task_id": task_id,
+        "message": f"已启动下载任务，共 {len(extracted_urls)} 个链接",
+        "count": len(extracted_urls),
+    }
+    state_info = client.login_state()
+    if state_info.get("logged_in") is False:
+        payload["login_required"] = True
+        payload["login_page"] = "xhs_login"
+        payload["warning"] = "当前未登录小红书，视频将保存为 720P 版本。登录后可下载 1080P 无水印视频。"
+    return jsonify(payload)
 
 @xhs_bp.route("/accounts", methods=["GET"])
 def list_accounts():

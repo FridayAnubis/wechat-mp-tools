@@ -59,14 +59,25 @@ https://www.xiaohongshu.com/explore/65f1a2b3...
         }
 
         try {
-            const res = await API.xhs.parse(text);
+            const res = await API.xhs.parse(text, { showError: false });
             
             previewContainer.style.display = 'block';
             
             const isVideo = res.type === '视频';
             const icon = isVideo ? '🎬' : '📸';
-            const countLabel = isVideo ? '无水印视频' : `图集 (共 ${res.images.length} 张图片)`;
+            const watermarked = !!res.video_watermarked;
+            const needLogin = !!res.login_required;
+            const countLabel = isVideo
+                ? (watermarked ? '视频（带水印）' : '无水印视频')
+                : `图集 (共 ${res.images.length} 张图片)`;
             const tagsHtml = (res.tags || []).map(t => `<span style="background:var(--bg-tertiary);color:var(--text-secondary);padding:2px 8px;border-radius:4px;font-size:0.75rem;font-weight:500;">#${this._esc(t)}</span>`).join(' ');
+            const loginBanner = needLogin ? `
+                    <div style="display:flex; align-items:center; gap:12px; background:var(--bg-tertiary); border-left:3px solid #faad14; padding:10px 12px; border-radius:6px;">
+                        <span style="flex:1; font-size:0.82rem; color:var(--text-secondary); line-height:1.5;">
+                            ${this._esc(res.login_hint || '未登录小红书：视频只能获取 720P 版本，登录后可下载 1080P 无水印视频。')}
+                        </span>
+                        <button class="btn btn-primary btn-sm" onclick="Router.navigate('xhs_login')" style="white-space:nowrap;">去登录</button>
+                    </div>` : '';
 
             previewContainer.innerHTML = `
                 <div style="background: var(--bg-card); border: 1px solid var(--primary); border-radius: 12px; padding: 20px; display: flex; flex-direction: column; gap: 16px; box-shadow: var(--shadow-sm);">
@@ -96,10 +107,20 @@ https://www.xiaohongshu.com/explore/65f1a2b3...
                             </div>
                         </div>
                     </div>
+                    ${loginBanner}
                 </div>
             `;
         } catch (err) {
-            Toast.error('解析预览失败: ' + err.message);
+            // 未登录是「可引导」的场景，弹确认框带用户去扫码，而不是甩一个红字错误
+            if (err.code === 'login_required') {
+                Modal.confirm(
+                    '需要登录小红书',
+                    `${this._esc(err.message || '未登录小红书，请先扫码登录。')}<br><br>是否立即前往扫码登录页面？`,
+                    () => { Router.navigate('xhs_login'); }
+                );
+            } else {
+                Toast.error('解析预览失败: ' + err.message);
+            }
         } finally {
             if (previewBtn) {
                 previewBtn.disabled = false;
@@ -130,15 +151,27 @@ https://www.xiaohongshu.com/explore/65f1a2b3...
         }
 
         try {
-            const res = await API.xhs.download(text);
+            const res = await API.xhs.download(text, { showError: false });
             if (res.task_id) {
+                // 未登录只给带水印版：不阻断下载，但必须显式告知
+                if (res.warning) {
+                    Toast.show(this._esc(res.warning), 'warning', 6000, '未登录小红书');
+                }
                 this.closePreview();
                 this.showProgressModal(res.task_id, res.count);
             } else {
                 throw new Error('启动任务失败');
             }
         } catch (err) {
-            Toast.error('启动下载失败: ' + err.message);
+            if (err.code === 'login_required') {
+                Modal.confirm(
+                    '需要登录小红书',
+                    `${this._esc(err.message || '未登录小红书，请先扫码登录。')}<br><br>是否立即前往扫码登录页面？`,
+                    () => { Router.navigate('xhs_login'); }
+                );
+            } else {
+                Toast.error('启动下载失败: ' + err.message);
+            }
         } finally {
             if (btn) {
                 btn.disabled = false;
