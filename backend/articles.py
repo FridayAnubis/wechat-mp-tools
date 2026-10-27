@@ -179,6 +179,13 @@ def _fetch_articles_page(fakeid: str, begin: int, count: int, keyword: str = "",
                         except Exception as ex_retry:
                             logger.debug("频控退避重试网络异常: %s", ex_retry)
 
+                        # 退避重试后依然触发 -2014 频控：激活腾讯防水墙/频控熔断并触发前端验证
+                        print(f"[_fetch_articles_page] 账号 [{acc_id}] 退避重试后仍处于高频风控 (-2014)，激活防水墙与熔断保护...", flush=True)
+                        record_failure(req_url, r.status_code, r.headers, r.text, "-2014")
+                        waterwall_hit(req_url, r.status_code, "-2014")
+                        account_pool.report(acc_id, status_code=499, ret=-2014, error_msg="触发高频风控 (-2014)，临时冷却并建议完成安全验证")
+                        return r, h, acc_id
+
                     # 2. 网关超时 -2012 (对齐 WRRetryHandler.canRetryTimeOut / whetherNeedToRetry 策略)
                     elif err_c == -2012 or "-2012" in r.text:
                         print(f"[_fetch_articles_page] 上游网关超时 (-2012)，遵循官方策略等待 0.5 秒自动重试...", flush=True)
@@ -273,7 +280,8 @@ def _fetch_articles_page(fakeid: str, begin: int, count: int, keyword: str = "",
         logger.debug("[_fetch_articles_page] mp/chapters 异常: %s", e)
 
     # ── 3. 备用通道：若推文仍为空，尝试从 article/list 补齐 ──
-    if len(articles) == 0 and len(raw_items) == 0:
+    from backend.waterwall import WATERWALL
+    if len(articles) == 0 and len(raw_items) == 0 and not WATERWALL.get("active"):
         try:
             u_alist = f"https://i.weread.qq.com/article/list?bookId={book_id}&synckey=0"
             resp_alist, h_alist, acc_alist = _do_get(u_alist)

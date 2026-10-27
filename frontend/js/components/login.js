@@ -278,6 +278,7 @@ const LoginPage = {
     },
 
     async startLogin() {
+        this._loginStartTime = Date.now();
         const btn = document.getElementById('btn-add-account');
         if (btn) {
             btn.disabled = true;
@@ -389,10 +390,13 @@ const LoginPage = {
                     this._pollTimer = null;
                     this._resetAddButton();
                 } else if (loginState.status === 'idle') {
-                    modal.style.display = 'none';
-                    clearInterval(this._pollTimer);
-                    this._pollTimer = null;
-                    this._resetAddButton();
+                    const isOpening = (Date.now() - (this._loginStartTime || 0)) < 3500;
+                    if (!isOpening) {
+                        modal.style.display = 'none';
+                        clearInterval(this._pollTimer);
+                        this._pollTimer = null;
+                        this._resetAddButton();
+                    }
                 }
             } catch (err) { /* silent */ }
         }, 1500);

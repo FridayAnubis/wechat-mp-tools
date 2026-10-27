@@ -192,7 +192,10 @@ def search_accounts():
                     from backend.weread_signer import activate_terminal_session
                     activate_terminal_session(headers, session=s)
                 elif "-2014" in err_text:
-                    account_pool.report(acc_id, status_code=499, error_msg="频控 -2014")
+                    from backend.waterwall import waterwall_hit, record_failure
+                    record_failure(url_mp, resp.status_code, resp.headers, resp.text, "-2014")
+                    waterwall_hit(url_mp, resp.status_code, "-2014")
+                    account_pool.report(acc_id, status_code=499, ret=-2014, error_msg="频控 -2014")
                     acc_id, vid, token, headers = borrow_weread_session()
                 else:
                     break
@@ -218,8 +221,9 @@ def search_accounts():
                     "service_type": 1,
                 })
 
-        # 若 scope=2 无结果，拉取通用搜索作为补充
-        if not results:
+        # 若 scope=2 无结果且未处于防水墙/频控熔断，拉取通用搜索作为补充
+        from backend.waterwall import WATERWALL
+        if not results and not WATERWALL.get("active"):
             url_gen = f"https://i.weread.qq.com/store/search?keyword={encoded_kw}&v=2&count=20"
             resp_gen = s.get(url_gen, headers=headers, timeout=10)
             if resp_gen.status_code == 200:
