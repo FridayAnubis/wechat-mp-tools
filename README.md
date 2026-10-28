@@ -90,20 +90,31 @@ docker compose up -d --build
 
 ### 2. 🗄️ 数据库配置（SQLite 与 MySQL）
 
-系统默认采用 **SQLite**（文件位于 `data/wechat_tools.db`），零配置、零依赖，启动时会自动建表并自动同步存量历史记录。
+本系统在 Docker 容器化环境下完美支持 **SQLite** 与 **MySQL** 双引擎：
 
-若在群晖 NAS、服务器集群或多容器中希望使用 **MySQL**，只需在 `.env` 或环境变量中配置即可自动切换：
+- **方式 1：默认本地 SQLite（推荐，零配置）**
+  无需任何额外设置，容器默认使用内置 SQLite 存储，数据库文件直接落在宿主机持久化卷 `./data/wechat_tools.db`，容器重启或重建数据丝毫不丢。
 
-```ini
-# 启用 MySQL 数据库存储
-DB_TYPE=mysql
-DB_HOST=192.168.1.100
-DB_PORT=3306
-DB_USER=root
-DB_PASSWORD=your_password
-DB_NAME=wechat_tools
-```
-*提示：系统具备平滑容灾降级机制，若远程 MySQL 暂时失联，会自动平滑回退至本地 SQLite 保护业务不中断。*
+- **方式 2：连接外部/局域网 MySQL（NAS、RDS、自建数据库）**
+  在 `deploy/docker/.env` 或运行参数中传入以下环境变量即可自动切换：
+  ```ini
+  DB_TYPE=mysql
+  DB_HOST=192.168.1.100    # MySQL 宿主机或服务 IP
+  DB_PORT=3306
+  DB_USER=root
+  DB_PASSWORD=your_password
+  DB_NAME=wechat_tools
+  ```
+
+- **方式 3：Docker Compose 一键附带启动 MySQL 8 服务**
+  `docker-compose.yaml` 内置了独立的 MySQL 8 服务，执行以下命令即可一键同时拉起应用容器与 MySQL 容器：
+  ```bash
+  # 启用 with-mysql profile 一键启动应用与 MySQL
+  docker compose --profile with-mysql up -d
+  ```
+  在 `.env` 中指定 `DB_TYPE=mysql`、`DB_HOST=db` 即可直接容器间内网互联。
+
+*安全保障：系统内置多级平滑容灾机制。若 MySQL 服务在启动初期尚未就绪或网络闪断，程序会自动平滑降级至本地 SQLite 守护业务，待 MySQL 恢复后自动重新握手。*
 
 ---
 

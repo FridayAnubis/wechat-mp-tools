@@ -16,4 +16,5 @@ flask-cors>=4.0
 requests>=2.31
 beautifulsoup4>=4.12
 playwright>=1.40
+pymysql>=1.1.0
 certifi

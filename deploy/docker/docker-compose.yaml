@@ -42,11 +42,19 @@ services:
       RSS_BASE_URL: ${RSS_BASE_URL:-}
       RSS_LOCAL_AVATAR: ${RSS_LOCAL_AVATAR:-1}
       RSS_AVATAR_FROM_ARTICLE: ${RSS_AVATAR_FROM_ARTICLE:-1}
+      # 数据库存储引擎配置（默认 sqlite 零配置落盘至 ./data/wechat_tools.db）
+      # 若连接外部或下方容器内 MySQL，设为 DB_TYPE=mysql
+      DB_TYPE: ${DB_TYPE:-sqlite}
+      DB_HOST: ${DB_HOST:-}
+      DB_PORT: ${DB_PORT:-3306}
+      DB_USER: ${DB_USER:-}
+      DB_PASSWORD: ${DB_PASSWORD:-}
+      DB_NAME: ${DB_NAME:-wechat_tools}
     ports:
       # 默认只绑本机，配合 Nginx 反代；要局域网直连改成 0.0.0.0
       - "${BIND_ADDR:-127.0.0.1}:${PORT:-5200}:5200"
     volumes:
-      # 唯一需要持久化的目录：设置、账号 cookie、下载历史、RSS 缓存、已下载文章
+      # 唯一需要持久化的目录：设置、账号 cookie、下载历史、RSS 缓存、已下载文章、SQLite 数据库文件
       - ./data:/app/data
       # 想把文章落到独立磁盘时，把设置里的 download_dir 改成 /downloads 再启用：
       # - ${DOWNLOAD_DIR:-./downloads}:/downloads
@@ -69,3 +77,22 @@ services:
       resources:
         limits:
           memory: ${MEMORY_LIMIT:-1g}
+
+  # 可选：由 Docker Compose 一键附带运行独立的 MySQL 8 数据库服务
+  # 启动命令：docker compose --profile with-mysql up -d
+  # 在 .env 中配合设置：DB_TYPE=mysql, DB_HOST=db, DB_USER=wechat, DB_PASSWORD=wechat123456
+  db:
+    image: mysql:8.0
+    container_name: wechat-mp-mysql
+    restart: unless-stopped
+    profiles: ["with-mysql"]
+    command: --default-authentication-plugin=mysql_native_password --character-set-server=utf8mb4 --collation-server=utf8mb4_unicode_ci
+    environment:
+      MYSQL_ROOT_PASSWORD: ${DB_ROOT_PASSWORD:-root123456}
+      MYSQL_DATABASE: ${DB_NAME:-wechat_tools}
+      MYSQL_USER: ${DB_USER:-wechat}
+      MYSQL_PASSWORD: ${DB_PASSWORD:-wechat123456}
+    volumes:
+      - ./mysql_data:/var/lib/mysql
+    ports:
+      - "127.0.0.1:${DB_PORT:-3306}:3306"
