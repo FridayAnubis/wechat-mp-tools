@@ -259,7 +259,8 @@ class XhsClient:
 
         last_err = None
         for attempt in range(retries):
-            lognormal_sleep(avg_delay=3.5)
+            if attempt > 0:
+                lognormal_sleep(avg_delay=2.0)
 
             proxies = get_proxies_dict()
             proxy_url = proxies.get("http") if proxies else None
@@ -452,49 +453,31 @@ class XhsClient:
         except Exception:
             return str(count)
 
-    def get_note_detail(self, url: str) -> dict:
-        state = self.get_initial_state(url)
-        
-        note = None
-        if "noteData" in state:
-            note = state.get("noteData", {}).get("data", {}).get("noteData")
-        if not note and "note" in state:
-            note_detail_map = state.get("note", {}).get("noteDetailMap", {})
-            if note_detail_map and isinstance(note_detail_map, dict):
-                note = list(note_detail_map.values())[-1].get("note")
-                
-        if not note:
-            # 先判登录态：未登录时小红书返回的是登录引导页，笼统报「风控/Cookie 失效」
-            # 会让用户以为工具坏了，实际只需要扫码登录
-            state_info = self.login_state()
-            if state_info.get("logged_in") is False:
-                raise XhsLoginRequired(
-                    "未登录小红书，该页面需要登录后才能查看。请先扫码登录小红书账号。"
-                )
-            raise ValueError("触发风控或 Cookie 失效，请在登录页更新 Cookie。")
-            
-        note_id = note.get("noteId") or note.get("id", "")
-        desc = note.get("desc", "").strip()
-        # 视频笔记普遍 title 为空、文案全在 desc；直接取 title 会得到空串，
-        # 下游 clean_filename 兜底后文件名变成 untitled，表现为「标题没有正常显示」
-        title = note.get("title", "").strip() or title_from_desc(desc, note_id)
-        
-        tag_list = note.get("tagList", [])
+    def _parse_note_detail(self, note: dict, note_id: str = "", url: str = "") -> dict:
+        """标准化解析单篇笔记的详情字段，兼容 Web API (feed) 和 SSR state 数据结构"""
+        if not isinstance(note, dict):
+            return {}
+
+        note_id = note_id or note.get("noteId") or note.get("note_id") or note.get("id", "")
+        desc = (note.get("desc") or "").strip()
+        title = (note.get("title") or note.get("display_title") or note.get("displayTitle") or "").strip() or title_from_desc(desc, note_id)
+
+        tag_list = note.get("tagList") or note.get("tag_list") or []
         tags = []
         if isinstance(tag_list, list):
             for tag in tag_list:
                 if isinstance(tag, dict) and tag.get("name"):
                     tags.append(tag["name"])
-                    
-        interact = note.get("interactInfo", {})
+
+        interact = note.get("interactInfo") or note.get("interact_info") or {}
         stats = {
-            "liked": self.format_count(interact.get("likedCount")),
-            "collected": self.format_count(interact.get("collectedCount")),
-            "comment": self.format_count(interact.get("commentCount")),
-            "share": self.format_count(interact.get("shareCount"))
+            "liked": self.format_count(interact.get("likedCount") or interact.get("liked_count")),
+            "collected": self.format_count(interact.get("collectedCount") or interact.get("collected_count")),
+            "comment": self.format_count(interact.get("commentCount") or interact.get("comment_count")),
+            "share": self.format_count(interact.get("shareCount") or interact.get("share_count"))
         }
-        
-        t = note.get("time")
+
+        t = note.get("time") or note.get("last_update_time")
         if t:
             try:
                 dt = datetime.fromtimestamp(float(t) / 1000)
@@ -506,56 +489,60 @@ class XhsClient:
         else:
             publish_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             timestamp = int(time.time())
-            
-        user_info = note.get("user", {})
-        author_id = user_info.get("userId", "")
+
+        user_info = note.get("user") or {}
+        author_id = user_info.get("userId") or user_info.get("user_id") or ""
         author = {
             "user_id": author_id,
-            "nickname": user_info.get("nickname", user_info.get("nickName", "未知博主")),
-            "avatar": user_info.get("avatar", ""),
+            "nickname": user_info.get("nickname") or user_info.get("nickName") or "未知博主",
+            "avatar": user_info.get("avatar") or "",
             "url": f"https://www.xiaohongshu.com/user/profile/{author_id}" if author_id else ""
         }
-        
+
         note_type_raw = note.get("type", "normal")
-        image_list = note.get("imageList", [])
+        image_list = note.get("imageList") or note.get("image_list") or []
         if not isinstance(image_list, list):
             image_list = []
-            
-        if note_type_raw == "video" or note.get("video"):
+
+        if note_type_raw == "video" or note.get("video") or note.get("media"):
             note_type = "视频"
         else:
             note_type = "图文"
-            
+
         images = []
         lives = []
-        
+
         settings = get_settings()
         img_fmt = settings.get("xhs_image_format", "png")
         live_enabled = settings.get("xhs_download_live", True)
-        
+
         for img in image_list:
             if not isinstance(img, dict):
                 continue
-            img_url = img.get("urlDefault") or img.get("url") or ""
+            img_url = img.get("urlDefault") or img.get("url_default") or img.get("url") or img.get("url_pre") or ""
+            if not img_url and img.get("info_list"):
+                info_list = img.get("info_list")
+                if isinstance(info_list, list) and len(info_list) > 0:
+                    img_url = info_list[0].get("url", "")
             if img_url:
                 try:
                     img_url = bytes(img_url, "utf-8").decode("unicode_escape")
                 except Exception:
                     pass
-                
+
                 parts = img_url.split("/")
                 if len(parts) >= 6:
                     token = "/".join(parts[5:]).split("!")[0]
                 else:
                     token = parts[-1].split("!")[0]
-                    
+
                 if img_fmt == "auto":
                     final_img_url = f"https://sns-img-bd.xhscdn.com/{token}"
                 else:
                     final_img_url = f"https://ci.xiaohongshu.com/{token}?imageView2/format/{img_fmt}"
-                    
+
                 images.append(final_img_url)
-                
+
                 live_url = None
                 if live_enabled:
                     stream = img.get("stream")
@@ -566,15 +553,15 @@ class XhsClient:
                             if isinstance(item, dict):
                                 live_url = item.get("masterUrl")
                 lives.append(live_url)
-                
+
         video = None
         video_candidates = []
-        video_watermarked = False      # True = 只能拿到带水印视频（通常是未登录）
+        video_watermarked = False
         video_info = note.get("video") or note.get("media") or {}
         if isinstance(video_info, dict) and video_info:
             media = video_info.get("media", {}) if isinstance(video_info.get("media"), dict) else (video_info if "stream" in video_info else {})
             stream = media.get("stream", {}) if isinstance(media.get("stream"), dict) else (video_info.get("stream", {}) if isinstance(video_info.get("stream"), dict) else (note.get("stream", {}) if isinstance(note.get("stream"), dict) else {}))
-            
+
             all_streams = []
             if isinstance(stream, dict):
                 for k, v in stream.items():
@@ -588,20 +575,15 @@ class XhsClient:
                     return (-1, 0, 0, 0)
                 v_codec = str(s.get("videoCodec", "")).lower()
                 s_desc = str(s.get("streamDesc", "")).lower()
-                # 第一优先级：无水印。259 是唯一烧录了动态水印的流，必须排最后
                 clean = 0 if is_watermarked_stream(s) else 1
-                # 第二优先级：分辨率（617 是 1080x1920，也是这里唯一无水印的高清版本）
                 res = float(s.get("height") or 0) * float(s.get("width") or 0) or float(s.get("height") or 0)
                 size = float(s.get("size") or s.get("videoBitrate") or 0)
-                # H.264 只作为末位 tiebreaker：它兼容性最好，但 259 恰好是 H.264，
-                # 一旦把编码提到分辨率前面，就会把带水印的版本选出来
                 is_h264 = 1 if (v_codec in ("ef4", "h264", "avc", "avc1") or "264" in s_desc) else 0
                 return (clean, res, size, is_h264)
 
             valid_streams = [s for s in all_streams if isinstance(s, dict)]
             if valid_streams:
                 valid_streams.sort(key=stream_sort_key, reverse=True)
-                # 所有候选都带水印时（极少见），标记出来交给上层提示用户
                 video_watermarked = all(is_watermarked_stream(s) for s in valid_streams)
                 for s in valid_streams:
                     master_url = s.get("masterUrl")
@@ -616,14 +598,12 @@ class XhsClient:
                     if url_field and url_field not in video_candidates:
                         video_candidates.append(url_field)
 
-            # originVideoKey 是作者原始上传文件（无转码、无水印），优先级最高，必须排在流之前
             origin_key = video_info.get("consumer", {}).get("originVideoKey")
             if origin_key:
                 for host in ["sns-video-bd.xhscdn.com", "sns-video-al.xhscdn.com", "sns-video-hw.xhscdn.com", "sns-video-qc.xhscdn.com"]:
                     u = f"https://{host}/{origin_key}"
                     if u not in video_candidates:
                         video_candidates.append(u)
-                # 原始文件一定无水印，把它挪到最前面
                 video_candidates.sort(key=lambda x: 0 if origin_key in x else 1)
                 video_watermarked = False
 
@@ -635,24 +615,26 @@ class XhsClient:
         if video_candidates:
             video = video_candidates[0]
             note_type = "视频"
-                            
+
         cover = images[0] if images else ""
         if note_type == "视频":
             cover_info = note.get("cover", {})
             if isinstance(cover_info, dict):
-                cover_url = cover_info.get("urlDefault") or cover_info.get("url")
+                cover_url = cover_info.get("urlDefault") or cover_info.get("url_default") or cover_info.get("url")
                 if cover_url:
                     try:
                         cover = bytes(cover_url, "utf-8").decode("unicode_escape")
                     except Exception:
                         cover = cover_url
-                        
-        token_match = re.search(r"xsec_token=([a-zA-Z0-9_\-]+)", url)
-        xsec_token = token_match.group(1) if token_match else ""
+
+        xsec_token = ""
+        if url:
+            token_match = re.search(r"xsec_token=([a-zA-Z0-9_\-]+)", url)
+            xsec_token = token_match.group(1) if token_match else ""
         clean_url = f"https://www.xiaohongshu.com/explore/{note_id}"
         if xsec_token:
             clean_url += f"?xsec_token={xsec_token}"
-            
+
         return {
             "note_id": note_id,
             "note_url": clean_url,
@@ -671,6 +653,160 @@ class XhsClient:
             "video_watermarked": video_watermarked,
             "cover": cover
         }
+
+    def get_note_detail_via_api(self, note_id: str, xsec_token: str = "") -> dict | None:
+        """参考 xhscrawl: 通过 edith.xiaohongshu.com/api/sns/web/v1/feed 官方接口签名提取笔记。
+        无需抓取网页 HTML，极大降低由于无头浏览器被识别导致的 461 / 验证码风控。"""
+        if Xhshow is None or not note_id:
+            return None
+        cookie = get_settings().get("xhs_cookie", "").strip()
+        if not cookie:
+            return None
+
+        from urllib.parse import unquote
+        xsec_token = unquote(xsec_token) if xsec_token else ""
+
+        payload = {
+            "source_note_id": note_id,
+            "image_formats": ["jpg", "webp", "avif"],
+            "extra": {"need_body_topic": "1"},
+        }
+        if xsec_token:
+            payload["xsec_token"] = xsec_token
+
+        uri = "/api/sns/web/v1/feed"
+        try:
+            from xhshow.config.config import CryptoConfig
+            config = CryptoConfig().with_overrides(PUBLIC_USERAGENT=self.USER_AGENT)
+            signer = Xhshow(config)
+            headers = signer.sign_headers_post(
+                uri=uri,
+                cookies=cookie,
+                payload=payload,
+                sign_format="xyw"
+            )
+            headers["cookie"] = cookie
+            headers["content-type"] = "application/json;charset=UTF-8"
+            headers["origin"] = "https://www.xiaohongshu.com"
+            headers["referer"] = "https://www.xiaohongshu.com/"
+            headers["user-agent"] = self.USER_AGENT
+            headers["accept"] = "application/json, text/plain, */*"
+
+            proxies = get_proxies_dict()
+            proxy_url = proxies.get("http") if proxies else None
+
+            resp = curl_requests.post(
+                "https://edith.xiaohongshu.com" + uri,
+                data=json.dumps(payload, separators=(",", ":"), ensure_ascii=False).encode("utf-8"),
+                headers=headers,
+                impersonate="chrome124",
+                proxy=proxy_url,
+                timeout=15
+            )
+            if resp.status_code == 200:
+                res_data = resp.json()
+                if res_data.get("success") and res_data.get("data"):
+                    items = res_data["data"].get("items") or []
+                    if items and isinstance(items, list):
+                        note_card = items[0].get("note_card") or items[0].get("noteCard") or {}
+                        if note_card:
+                            return self._parse_note_detail(note_card, note_id=note_id)
+        except Exception as e:
+            print(f"Feed API 提取笔记详情失败: {e}")
+        return None
+
+    def get_note_detail_via_browser(self, url: str) -> dict | None:
+        """参考 xhscrawl: 使用 Playwright + Stealth 自动化渲染获取笔记（终极防风控兜底）"""
+        from playwright.sync_api import sync_playwright
+        from backend.runtime import launch_chromium
+        try:
+            from playwright_stealth import Stealth
+            has_stealth = True
+        except ImportError:
+            has_stealth = False
+
+        cookie = get_settings().get("xhs_cookie", "").strip()
+        pairs = []
+        if cookie:
+            for part in cookie.split(";"):
+                if "=" in part:
+                    k, v = part.split("=", 1)
+                    pairs.append({"name": k.strip(), "value": v.strip(), "domain": ".xiaohongshu.com", "path": "/"})
+
+        try:
+            with sync_playwright() as p:
+                browser = launch_chromium(p.chromium, headless=True, args=['--disable-blink-features=AutomationControlled'])
+                try:
+                    context = browser.new_context(
+                        viewport={'width': 1280, 'height': 800},
+                        user_agent=self.USER_AGENT,
+                        locale="zh-CN",
+                        timezone_id="Asia/Shanghai"
+                    )
+                    if pairs:
+                        context.add_cookies(pairs)
+                    page = context.new_page()
+                    if has_stealth:
+                        Stealth().apply_stealth_sync(page)
+                    page.goto(url, wait_until="domcontentloaded", timeout=15000)
+                    page.wait_for_timeout(1000)
+
+                    state = page.evaluate("() => window.__INITIAL_STATE__ || window.__INITIAL_DATA__ || {}")
+                    if state:
+                        note = None
+                        if "noteData" in state:
+                            note = state.get("noteData", {}).get("data", {}).get("noteData")
+                        if not note and "note" in state:
+                            note_detail_map = state.get("note", {}).get("noteDetailMap", {})
+                            if note_detail_map and isinstance(note_detail_map, dict):
+                                note = list(note_detail_map.values())[-1].get("note")
+                        if note:
+                            return self._parse_note_detail(note, url=url)
+                finally:
+                    browser.close()
+        except Exception as e:
+            print(f"浏览器兜底获取笔记详情失败: {e}")
+        return None
+
+    def get_note_detail(self, url: str) -> dict:
+        note_id = self.extract_note_id(url)
+        token_match = re.search(r"xsec_token=([a-zA-Z0-9_\-]+)", url)
+        xsec_token = token_match.group(1) if token_match else ""
+
+        # 1. 优先尝试 xhscrawl 推荐的 edith feed 官方签名接口
+        if note_id:
+            api_detail = self.get_note_detail_via_api(note_id, xsec_token)
+            if api_detail:
+                return api_detail
+
+        # 2. 备选：页面 HTTP SSR 解析
+        last_ssr_err = None
+        try:
+            state = self.get_initial_state(url)
+            note = None
+            if "noteData" in state:
+                note = state.get("noteData", {}).get("data", {}).get("noteData")
+            if not note and "note" in state:
+                note_detail_map = state.get("note", {}).get("noteDetailMap", {})
+                if note_detail_map and isinstance(note_detail_map, dict):
+                    note = list(note_detail_map.values())[-1].get("note")
+            if note:
+                return self._parse_note_detail(note, note_id=note_id, url=url)
+        except Exception as e:
+            last_ssr_err = e
+
+        # 3. 终极防风控兜底：Playwright + Stealth 自动化渲染
+        browser_detail = self.get_note_detail_via_browser(url)
+        if browser_detail:
+            return browser_detail
+
+        if last_ssr_err:
+            raise last_ssr_err
+
+        state_info = self.login_state()
+        if state_info.get("logged_in") is False:
+            raise XhsLoginRequired("未登录小红书，该页面需要登录后才能查看。请先扫码登录小红书账号。")
+        raise ValueError("触发风控或 Cookie 失效，请在登录页更新 Cookie。")
 
     def _parse_note_item(self, it: dict) -> dict | None:
         """把 user_posted API 或 SSR / DOM 的单条 note 解析成前端列表项；非 dict 返回 None。"""
@@ -781,7 +917,6 @@ class XhsClient:
 
         proxies = get_proxies_dict()
         proxy_url = proxies.get("http") if proxies else None
-        lognormal_sleep(avg_delay=4.5)
         try:
             resp = curl_requests.get(
                 full_url, headers=headers, impersonate="chrome124",
@@ -899,7 +1034,19 @@ class XhsClient:
             result["notes"] = notes_list
             result["has_more"] = browser_has_more
         except Exception as browser_err:
-            print(f"浏览器拦截获取笔记列表失败: {browser_err}")
+            err_msg = str(browser_err)
+            try:
+                print(f"浏览器拦截获取笔记列表失败: {err_msg}")
+            except Exception:
+                pass
+
+            # 如果明确需要登录或登录已失效，直接标记 login_required 并提示用户，无需多余重试
+            if "登录" in err_msg or "安全限制" in err_msg:
+                result["notes"] = self._parse_ssr_notes(state)
+                result["login_required"] = True
+                result["warning"] = "小红书登录凭证已失效或未登录，无法拉取完整博主笔记列表。请在左侧「登录管理」重新扫码登录。"
+                return result
+
             try:
                 notes_list, _has_more, _cursor = self.get_user_posted(user_id, xsec_token, xsec_source=xsec_source)
                 result["notes"] = notes_list
@@ -974,7 +1121,7 @@ class _XhsBrowserSession:
         self._init_error = None
         self._thread = threading.Thread(target=self._run, daemon=True)
         self._thread.start()
-        self._ready.wait(timeout=45)
+        self._ready.wait(timeout=15)
         if self._init_error:
             raise self._init_error
         if not self._ready.is_set():
@@ -1033,11 +1180,20 @@ class _XhsBrowserSession:
 
     def _do_scroll(self, page, max_pages: int) -> tuple:
         target = self._pages_loaded + max_pages
-        for _ in range(max_pages * 6 + 3):
+        idle_rounds = 0
+        last_captured = len(self._captured)
+        for _ in range(max_pages * 4 + 2):
             if not self._has_more or self._pages_loaded >= target:
                 break
             page.mouse.wheel(0, 1000)
-            page.wait_for_timeout(2000)
+            page.wait_for_timeout(800)
+            if len(self._captured) == last_captured:
+                idle_rounds += 1
+                if idle_rounds >= 3:
+                    break
+            else:
+                idle_rounds = 0
+                last_captured = len(self._captured)
 
         fresh = []
         for it in self._captured:
@@ -1066,15 +1222,25 @@ class _XhsBrowserSession:
                 try:
                     context = browser.new_context(
                         viewport={'width': 1280, 'height': 800},
-                        user_agent=self._user_agent
-                    )
-                    context.add_init_script(
-                        "Object.defineProperty(navigator, 'webdriver', {get: () => undefined})"
+                        user_agent=self._user_agent,
+                        locale="zh-CN",
+                        timezone_id="Asia/Shanghai"
                     )
                     context.add_cookies(self._cookie_pairs())
                     page = context.new_page()
+                    try:
+                        from playwright_stealth import Stealth
+                        Stealth().apply_stealth_sync(page)
+                    except Exception:
+                        pass
                     page.on("response", self._on_response)
-                    page.goto(profile_url, wait_until="networkidle", timeout=30000)
+                    page.goto(profile_url, wait_until="domcontentloaded", timeout=15000)
+
+                    # 检查是否重定向到登录页或遇到安全验证
+                    cur_url = (page.url or "").lower()
+                    cur_title = page.title() or ""
+                    if "/login" in cur_url or "安全限制" in cur_title or "验证码" in cur_title:
+                        raise RuntimeError("小红书登录已失效或需要重新验证，请在左侧「登录管理」重新扫码登录")
 
                     # 提取首屏（第 1 页）SSR 及 DOM 笔记
                     try:
@@ -1185,11 +1351,11 @@ class _XhsBrowserSession:
                         print(f"提取首屏笔记异常: {e}")
 
                     if self._pages_loaded == 0:
-                        page.wait_for_timeout(3000)
+                        page.wait_for_timeout(1000)
                     if self._pages_loaded == 0:
-                        for _ in range(3):
+                        for _ in range(2):
                             page.mouse.wheel(0, 800)
-                            page.wait_for_timeout(2000)
+                            page.wait_for_timeout(1000)
                             if self._pages_loaded > 0:
                                 break
 

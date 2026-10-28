@@ -9,8 +9,10 @@ import subprocess
 import json
 import time
 import re
+import random
 import urllib.parse
 import threading
+import logging
 import requests as req
 import shutil
 from flask import Blueprint, jsonify, request, Response
@@ -19,7 +21,7 @@ from pathlib import Path
 
 from backend.config import (
     CONFIG_FILE, BASE_URL, DEFAULT_HEADERS, OUTPUT_DIR, DATA_DIR,
-    DOWNLOAD_HISTORY_FILE,
+    DOWNLOAD_HISTORY_FILE, ACCOUNTS_FILE,
     load_json, save_json, get_settings, get_proxies_dict, report_proxy_status,
     normalize_wechat_url, get_default_wechat_ua
 )
@@ -30,6 +32,7 @@ from backend.runtime import desktop_available, host_path_hint
 from backend.request_profile import sleep_backoff, sleep_throttled
 
 articles_bp = Blueprint("articles", __name__, url_prefix="/api/articles")
+logger = logging.getLogger("backend.articles")
 
 # 下载进度管理
 _download_tasks = {}
@@ -67,7 +70,97 @@ def fetch_article_detail_content(url: str, review_id: str = "") -> str:
 
 
 _review_url_cache: dict[str, str] = {}
+_review_info_cache: dict[str, dict] = {}
 _review_cache_lock = threading.Lock()
+
+
+def _check_is_original(it: dict, mp_i: dict) -> bool:
+    """准确判断文章是否带有原创声明标签"""
+    for src in (mp_i, it):
+        if not isinstance(src, dict):
+            continue
+        c_type = src.get("copyright_type") or src.get("copyrightType") or src.get("copyright") or src.get("copyright_stat")
+        if c_type is not None:
+            try:
+                if int(c_type) > 0:
+                    return True
+            except (ValueError, TypeError):
+                if str(c_type).strip().lower() in ("1", "2", "true", "yes", "original"):
+                    return True
+        is_orig = src.get("is_original") or src.get("isOriginal") or src.get("original")
+        if is_orig is True:
+            return True
+        if isinstance(is_orig, (int, str)) and str(is_orig).strip().lower() in ("1", "true", "yes"):
+            return True
+    return False
+
+
+def _resolve_review_info(review_id: str, headers: dict) -> dict:
+    """通过微信读书 review/single 接口动态解析推文详情 (短链 doc_url、真实发布时间、原创标记等)"""
+    if not review_id:
+        return {}
+    with _review_cache_lock:
+        if review_id in _review_info_cache:
+            return _review_info_cache[review_id]
+
+    info = {
+        "doc_url": "",
+        "create_time": 0,
+        "is_original": False,
+        "title": "",
+        "digest": "",
+        "author": "",
+        "cover": "",
+    }
+    short_id = short_id_from_review_id(review_id)
+    if short_id:
+        info["doc_url"] = f"https://mp.weixin.qq.com/s/{short_id}"
+
+    try:
+        url = f"https://i.weread.qq.com/review/single?reviewId={review_id}"
+        s = get_weread_session()
+        resp = s.get(url, headers=headers, timeout=6)
+        if resp.status_code == 200:
+            data = resp.json()
+            r_data = data.get("review") or {}
+            mp_info = r_data.get("mpInfo") or {}
+            orig_id = mp_info.get("originalId", "")
+            if orig_id and len(orig_id) >= 15:
+                doc_url = normalize_wechat_short_url(f"https://mp.weixin.qq.com/s/{orig_id}")
+            else:
+                doc_url = normalize_wechat_short_url(mp_info.get("doc_url", ""))
+            if doc_url:
+                info["doc_url"] = doc_url
+
+            c_time = (
+                r_data.get("createTime")
+                or r_data.get("updateTime")
+                or mp_info.get("time")
+                or mp_info.get("create_time")
+                or mp_info.get("update_time")
+                or mp_info.get("publish_time")
+                or 0
+            )
+            if c_time:
+                info["create_time"] = int(c_time)
+
+            info["title"] = mp_info.get("title") or r_data.get("title") or ""
+            info["digest"] = mp_info.get("digest") or ""
+            info["author"] = mp_info.get("author") or ""
+            info["cover"] = mp_info.get("pic_url") or mp_info.get("thumbUrl") or ""
+            info["is_original"] = _check_is_original(r_data, mp_info)
+
+            with _review_cache_lock:
+                _review_info_cache[review_id] = info
+                if info["doc_url"]:
+                    _review_url_cache[review_id] = info["doc_url"]
+            return info
+    except Exception:
+        pass
+
+    with _review_cache_lock:
+        _review_info_cache[review_id] = info
+    return info
 
 
 def _resolve_review_doc_url(review_id: str, headers: dict) -> str:
@@ -83,24 +176,8 @@ def _resolve_review_doc_url(review_id: str, headers: dict) -> str:
     with _review_cache_lock:
         if review_id in _review_url_cache:
             return _review_url_cache[review_id]
-    try:
-        url = f"https://i.weread.qq.com/review/single?reviewId={review_id}"
-        s = get_weread_session()
-        resp = s.get(url, headers=headers, timeout=6)
-        if resp.status_code == 200:
-            mp_info = resp.json().get("review", {}).get("mpInfo", {})
-            orig_id = mp_info.get("originalId", "")
-            if orig_id and len(orig_id) >= 15:
-                doc_url = normalize_wechat_short_url(f"https://mp.weixin.qq.com/s/{orig_id}")
-            else:
-                doc_url = normalize_wechat_short_url(mp_info.get("doc_url", ""))
-            if doc_url:
-                with _review_cache_lock:
-                    _review_url_cache[review_id] = doc_url
-                return doc_url
-    except Exception:
-        pass
-    return ""
+    info = _resolve_review_info(review_id, headers)
+    return info.get("doc_url", "")
 
 
 
@@ -234,35 +311,7 @@ def _fetch_articles_page(fakeid: str, begin: int, count: int, keyword: str = "",
     active_headers = None
     active_acc_id = None
 
-    # ── 1. 优先获取 mp/cover 最新置顶推文 (第一页时优先执行，100% 成功率带 doc_url) ──
-    if begin == 0:
-        try:
-            u_cov = f"https://i.weread.qq.com/mp/cover?bookId={book_id}"
-            resp_cov, h_cov, acc_cov = _do_get(u_cov)
-            if resp_cov and resp_cov.status_code == 200:
-                active_headers = h_cov
-                active_acc_id = acc_cov
-                cdata = resp_cov.json()
-                rid = cdata.get("reviewId", "")
-                if rid:
-                    doc_u = _resolve_review_doc_url(rid, h_cov or {})
-                    t_cov = cdata.get("title", "")
-                    if not keyword or keyword.lower() in t_cov.lower():
-                        articles.append({
-                            "title": t_cov,
-                            "link": doc_u,
-                            "cover": cdata.get("pic", "") or cdata.get("avatar", ""),
-                            "digest": "",
-                            "author": account_name or cdata.get("name", ""),
-                            "update_time": 0,
-                            "is_original": True,
-                            "item_show_type": 0,
-                            "id": rid,
-                        })
-        except Exception as e:
-            logger.debug("[_fetch_articles_page] mp/cover 获取异常: %s", e)
-
-    # ── 2. 尝试从 mp/chapters 获取分页推文列表 ──
+    # ── 1. 优先尝试从 mp/chapters 获取分页推文列表 (官方标准分页推文接口) ──
     raw_items = []
     try:
         url_chap = f"https://i.weread.qq.com/mp/chapters?bookId={book_id}&count={count}&offset={begin}&pf=android"
@@ -279,9 +328,9 @@ def _fetch_articles_page(fakeid: str, begin: int, count: int, keyword: str = "",
     except Exception as e:
         logger.debug("[_fetch_articles_page] mp/chapters 异常: %s", e)
 
-    # ── 3. 备用通道：若推文仍为空，尝试从 article/list 补齐 ──
+    # ── 2. 备用通道：若推文仍为空，尝试从 article/list 补齐 ──
     from backend.waterwall import WATERWALL
-    if len(articles) == 0 and len(raw_items) == 0 and not WATERWALL.get("active"):
+    if len(raw_items) == 0 and not WATERWALL.get("active"):
         try:
             u_alist = f"https://i.weread.qq.com/article/list?bookId={book_id}&synckey=0"
             resp_alist, h_alist, acc_alist = _do_get(u_alist)
@@ -293,36 +342,104 @@ def _fetch_articles_page(fakeid: str, begin: int, count: int, keyword: str = "",
         except Exception as e:
             logger.debug("[_fetch_articles_page] article/list 备用拉取异常: %s", e)
 
-    # ── 4. 并发解析推文原生官方链接 doc_url 并去重合并 ──
+    # ── 3. 兜底通道：若推文仍为空且为第一页 (begin == 0)，从 mp/cover 获取置顶/最新封面推文 ──
+    if len(raw_items) == 0 and begin == 0 and not WATERWALL.get("active"):
+        try:
+            u_cov = f"https://i.weread.qq.com/mp/cover?bookId={book_id}"
+            resp_cov, h_cov, acc_cov = _do_get(u_cov)
+            if resp_cov and resp_cov.status_code == 200:
+                active_headers = h_cov or active_headers
+                active_acc_id = acc_cov or active_acc_id
+                cdata = resp_cov.json()
+                rid = cdata.get("reviewId", "")
+                if rid:
+                    info = _resolve_review_info(rid, active_headers or {})
+                    t_cov = info.get("title") or cdata.get("title", "")
+                    doc_u = info.get("doc_url") or _resolve_review_doc_url(rid, active_headers or {})
+                    cov_time = info.get("create_time") or cdata.get("createTime") or cdata.get("updateTime") or 0
+                    if not keyword or keyword.lower() in t_cov.lower():
+                        articles.append({
+                            "title": t_cov,
+                            "link": doc_u,
+                            "cover": info.get("cover") or cdata.get("pic", "") or cdata.get("avatar", ""),
+                            "digest": info.get("digest") or "",
+                            "author": info.get("author") or account_name or cdata.get("name", ""),
+                            "update_time": int(cov_time or 0),
+                            "is_original": info.get("is_original", False),
+                            "item_show_type": 0,
+                            "id": rid,
+                        })
+        except Exception as e:
+            logger.debug("[_fetch_articles_page] mp/cover 获取异常: %s", e)
+
+    # ── 4. 并发解析推文原生官方链接 doc_url、真实时间戳及原创标记 ──
     if raw_items:
         import concurrent.futures
-        def _get_url(it):
-            rid = it.get("reviewId", "")
+
+        def _get_item_meta(it):
+            mp_i = it.get("mpInfo", {}) if isinstance(it.get("mpInfo"), dict) else {}
+            rid = str(it.get("reviewId") or "")
             short_id = short_id_from_review_id(rid)
+            doc_u = ""
             if short_id:
-                return f"https://mp.weixin.qq.com/s/{short_id}"
-            doc_u = normalize_wechat_short_url(it.get("mpInfo", {}).get("doc_url", ""))
-            if doc_u:
-                return doc_u
-            return _resolve_review_doc_url(rid, active_headers or {})
+                doc_u = f"https://mp.weixin.qq.com/s/{short_id}"
+            else:
+                doc_u = normalize_wechat_short_url(mp_i.get("doc_url", ""))
+
+            c_time = (
+                it.get("createTime")
+                or it.get("updateTime")
+                or it.get("publishTime")
+                or it.get("create_time")
+                or it.get("update_time")
+                or mp_i.get("time")
+                or mp_i.get("create_time")
+                or mp_i.get("update_time")
+                or mp_i.get("publish_time")
+                or 0
+            )
+
+            is_orig = _check_is_original(it, mp_i)
+
+            # 若短链缺失或时间戳未知，通过 review/single 动态反查补齐
+            if (not doc_u or not c_time) and rid:
+                rev_info = _resolve_review_info(rid, active_headers or {})
+                if not doc_u:
+                    doc_u = rev_info.get("doc_url", "")
+                if not c_time:
+                    c_time = rev_info.get("create_time", 0)
+                if not is_orig:
+                    is_orig = rev_info.get("is_original", False)
+
+            return doc_u, int(c_time or 0), is_orig
 
         with concurrent.futures.ThreadPoolExecutor(max_workers=min(10, max(1, len(raw_items)))) as ex:
-            urls = list(ex.map(_get_url, raw_items))
+            metas = list(ex.map(_get_item_meta, raw_items))
 
-        for it, doc_u in zip(raw_items, urls):
-            mp_i = it.get("mpInfo", {})
+        for it, (doc_u, create_t, is_orig) in zip(raw_items, metas):
+            mp_i = it.get("mpInfo", {}) if isinstance(it.get("mpInfo"), dict) else {}
             title = mp_i.get("title") or it.get("title") or ""
             if not title:
                 continue
             if keyword and keyword.lower() not in title.lower():
                 continue
-            # 去重：若已有（如置顶推文），跳过
-            if any(existing.get("title") == title for existing in articles):
-                continue
-
             pic = mp_i.get("pic_url") or mp_i.get("thumbUrl") or it.get("cover") or ""
-            create_t = it.get("createTime") or mp_i.get("time") or 0
-            review_id = it.get("reviewId") or ""
+            review_id = str(it.get("reviewId") or "")
+
+            # 若已有相同项（如首屏兜底），用真实时间戳与详细信息补全
+            existing = next((ex for ex in articles if ex.get("title") == title or (review_id and str(ex.get("id")) == review_id)), None)
+            if existing:
+                if (not existing.get("update_time") or existing.get("update_time") == 0) and create_t:
+                    existing["update_time"] = create_t
+                if not existing.get("cover") and pic:
+                    existing["cover"] = pic
+                if not existing.get("link") and doc_u:
+                    existing["link"] = doc_u
+                if not existing.get("id") and review_id:
+                    existing["id"] = review_id
+                if not existing.get("is_original") and is_orig:
+                    existing["is_original"] = is_orig
+                continue
 
             articles.append({
                 "title": title,
@@ -331,7 +448,7 @@ def _fetch_articles_page(fakeid: str, begin: int, count: int, keyword: str = "",
                 "digest": mp_i.get("digest", ""),
                 "author": mp_i.get("author") or account_name or "",
                 "update_time": create_t,
-                "is_original": True,
+                "is_original": is_orig,
                 "item_show_type": 0,
                 "id": review_id,
             })
@@ -504,6 +621,104 @@ def start_range_download():
     thread.start()
 
     return jsonify({"task_id": task_id, "message": "已启动按时间范围下载任务"})
+
+
+@articles_bp.route("/collect-latest", methods=["POST"])
+def collect_latest():
+    """单个公众号一键采集最近 N 条（默认 50 条），自动去重跳过并深度优化风控"""
+    data = request.get_json() or {}
+    fakeid = data.get("fakeid", "").strip()
+    account_name = data.get("account_name", "").strip()
+    limit = int(data.get("limit", 50) or 50)
+    skip_existing = data.get("skip_existing", True)
+
+    if not fakeid:
+        return jsonify({"error": "缺少公众号 fakeid"}), 400
+
+    if not account_name:
+        accounts = load_json(ACCOUNTS_FILE, [])
+        for a in accounts:
+            if a.get("fakeid") == fakeid:
+                account_name = a.get("nickname", "unknown")
+                break
+        account_name = account_name or "unknown"
+
+    task_id = f"collect_{int(time.time())}"
+    with _download_lock:
+        _download_tasks[task_id] = {
+            "status": "running",
+            "mode": "collect",
+            "total": 0,
+            "completed": 0,
+            "failed": 0,
+            "scanned": 0,
+            "current": f"准备采集【{account_name}】最近 {limit} 篇推文...",
+            "results": [],
+            "start_time": time.time(),
+            "cancel_requested": False,
+            "stop_reason": "",
+            "account_name": account_name,
+        }
+
+    targets = [{"fakeid": fakeid, "name": account_name}]
+    thread = threading.Thread(
+        target=_do_collect_latest,
+        args=(task_id, targets, limit, skip_existing),
+        daemon=True,
+    )
+    thread.start()
+
+    return jsonify({"task_id": task_id, "message": f"已启动【{account_name}】一键采集任务（最近 {limit} 篇）"})
+
+
+@articles_bp.route("/collect-all", methods=["POST"])
+def collect_all():
+    """全部关注公众号一键采集（各最新 50 条），串行流转、自动跳过已下载、多账号轮换防风控"""
+    data = request.get_json() or {}
+    limit = int(data.get("limit", 50) or 50)
+    skip_existing = data.get("skip_existing", True)
+
+    accounts = load_json(ACCOUNTS_FILE, [])
+    if not accounts:
+        return jsonify({"error": "关注列表为空，请先在公众号管理中关注或添加公众号"}), 400
+
+    targets = []
+    for a in accounts:
+        fid = a.get("fakeid", "").strip()
+        name = a.get("nickname", "").strip() or fid
+        if fid:
+            targets.append({"fakeid": fid, "name": name})
+
+    if not targets:
+        return jsonify({"error": "没有可采集的公众号"}), 400
+
+    task_id = f"collect_all_{int(time.time())}"
+    with _download_lock:
+        _download_tasks[task_id] = {
+            "status": "running",
+            "mode": "collect_all",
+            "total": 0,
+            "completed": 0,
+            "failed": 0,
+            "scanned": 0,
+            "total_accounts": len(targets),
+            "current_account_idx": 0,
+            "current_account": "",
+            "current": f"准备采集全部 {len(targets)} 个公众号（各最新 {limit} 篇）...",
+            "results": [],
+            "start_time": time.time(),
+            "cancel_requested": False,
+            "stop_reason": "",
+        }
+
+    thread = threading.Thread(
+        target=_do_collect_latest,
+        args=(task_id, targets, limit, skip_existing),
+        daemon=True,
+    )
+    thread.start()
+
+    return jsonify({"task_id": task_id, "message": f"已启动全部 {len(targets)} 个公众号一键采集任务"})
 
 
 @articles_bp.route("/download-cancel/<task_id>", methods=["POST"])
@@ -973,7 +1188,7 @@ def _do_batch_download(task_id: str, articles: list, account_name: str):
             if not real_account or real_account == "url_download":
                 real_account = account_name if account_name != "url_download" else "链接下载"
             # 记录到下载历史
-            history.append({
+            hist_entry = {
                 "title": title,
                 "link": normalize_wechat_short_url(article.get("original_url") or link),
                 "account": real_account,
@@ -987,7 +1202,13 @@ def _do_batch_download(task_id: str, articles: list, account_name: str):
                 "publish_time": result.get("publish_time", int(time.time())),
                 "has_markdown": result.get("has_markdown", False),
                 "has_pdf": result.get("has_pdf", False),
-            })
+            }
+            history.append(hist_entry)
+            try:
+                from backend.db import record_history
+                record_history(hist_entry)
+            except Exception:
+                pass
 
             if i < len(articles) - 1:
                 # 对数正态节流：均值与原实现 max(1.0, delay)+U(0.3,1.2) 的期望（约 1.75s）对齐，
@@ -1067,15 +1288,15 @@ def _download_article_into_task(task_id: str, article: dict, account_name: str, 
         if success:
             _download_tasks[task_id]["completed"] += 1
             _download_tasks[task_id]["results"].append({
-                "title": title, "success": True, "path": downloaded_path or str(out_dir / title)
+                "title": title, "account": account_name, "success": True, "path": downloaded_path or str(out_dir / title)
             })
         else:
             _download_tasks[task_id]["failed"] += 1
             _download_tasks[task_id]["results"].append({
-                "title": title, "success": False, "error": error_msg
+                "title": title, "account": account_name, "success": False, "error": error_msg
             })
 
-    history.append({
+    hist_entry = {
         "title": title,
         "link": link,
         "account": account_name,
@@ -1088,7 +1309,14 @@ def _download_article_into_task(task_id: str, article: dict, account_name: str, 
         "publish_time": result.get("publish_time", int(time.time())),
         "has_markdown": result.get("has_markdown", False),
         "has_pdf": result.get("has_pdf", False),
-    })
+        "review_id": review_id,
+    }
+    history.append(hist_entry)
+    try:
+        from backend.db import record_history
+        record_history(hist_entry)
+    except Exception:
+        pass
 
 
 def _do_range_download(
@@ -1100,7 +1328,7 @@ def _do_range_download(
     keyword: str,
     page_size: int,
 ):
-    """分页拉取文章，下载时间范围内文章，遇到更早文章后停止。"""
+    """分页拉取文章，下载时间范围内文章，遇到更早文章后停止（带存量智能跳过与风控平滑）。"""
     settings = get_settings()
     delay = settings.get("request_delay", 0.8)
     history = load_json(DOWNLOAD_HISTORY_FILE, [])
@@ -1135,13 +1363,51 @@ def _do_range_download(
             out_of_range_count = 0
             for article in articles:
                 article_time = article.get("update_time") or 0
-                # update_time 为 0 表示时间未知，不做时间过滤（宁多勿漏）
                 if article_time > 0:
-                    if article_time > end_time:
+                    if end_time and article_time > end_time:
                         continue
-                    if article_time < start_time:
+                    if start_time and article_time < start_time:
                         out_of_range_count += 1
                         continue
+                elif start_time or end_time:
+                    # 避免在指定具体时间范围时误下载时间未知的旧置顶/封面推文
+                    continue
+
+                link = normalize_wechat_short_url(article.get("link", ""))
+                title = article.get("title", f"article_{downloaded_index + 1}")
+
+                # 智能跳过已存在并下载成功的文章，极速节流防封控
+                is_exist = False
+                existing_path = None
+                try:
+                    from backend.db import is_article_downloaded
+                    is_exist, existing_path = is_article_downloaded(account_name, link, title)
+                except Exception:
+                    pass
+
+                if not is_exist:
+                    for h_item in history:
+                        if not isinstance(h_item, dict):
+                            continue
+                        h_link = h_item.get("link", "")
+                        h_title = h_item.get("title", "")
+                        h_path = h_item.get("path")
+                        if (h_link and h_link == link) or (h_title and h_title == title and h_item.get("account") == account_name):
+                            if h_item.get("success") and h_path and Path(h_path).exists():
+                                is_exist = True
+                                existing_path = h_path
+                                break
+
+                if is_exist:
+                    with _download_lock:
+                        task = _download_tasks.get(task_id, {})
+                        task["total"] += 1
+                        task["completed"] += 1
+                        task["current"] = f"[已存在跳过] {title}"
+                        task["results"].append({
+                            "title": title, "account": account_name, "success": True, "path": existing_path, "skipped": True
+                        })
+                    continue
 
                 with _download_lock:
                     task = _download_tasks.get(task_id, {})
@@ -1156,16 +1422,15 @@ def _do_range_download(
 
                 _download_article_into_task(task_id, article, account_name, history, downloaded_index)
                 downloaded_index += 1
-                # 对数正态节流：均值与原实现 max(1.0, delay)+U(0.3,1.2) 的期望（约 1.75s）对齐，
-                # 只是把原本 1.3~2.2s 的窄带换成带长尾的分布；min_delay 抬住下沿，
-                # 保证没有任何一次间隔比原来的 1.3s 更密
-                sleep_throttled(max(1.0, delay) + 0.75, min_delay=1.3)
+                sleep_throttled(max(1.0, delay) + random.uniform(0.3, 0.8), min_delay=1.2)
 
-            # 当前页所有文章都早于 start_time，说明后续页也不会有范围内的文章了
-            if out_of_range_count > 0 and out_of_range_count >= len(articles):
+            # 当前页所有具备有效时间戳的文章都早于 start_time，停止后续扫描
+            valid_time_count = sum(1 for a in articles if (a.get("update_time") or 0) > 0)
+            if start_time > 0 and valid_time_count > 0 and out_of_range_count >= valid_time_count:
                 stop = True
                 with _download_lock:
                     _download_tasks[task_id]["stop_reason"] = "已到达所选时间范围之前的文章"
+                break
 
             begin += page_size
             if total_count and begin >= total_count:
@@ -1193,6 +1458,151 @@ def _do_range_download(
         save_json(DOWNLOAD_HISTORY_FILE, history)
         with _download_lock:
             task = _download_tasks[task_id]
+            task["status"] = "failed"
+            task["current"] = ""
+            task["stop_reason"] = str(e)
+            task["end_time"] = time.time()
+
+
+def _do_collect_latest(task_id: str, targets: list, limit: int = 50, skip_existing: bool = True):
+    """一键采集后台处理函数：支持单个或全部公众号，自动跳过存量文章，深度优化风控"""
+    settings = get_settings()
+    delay = settings.get("request_delay", 0.8)
+    history = load_json(DOWNLOAD_HISTORY_FILE, [])
+
+    try:
+        for acc_idx, target in enumerate(targets):
+            fakeid = target["fakeid"]
+            account_name = target["name"]
+
+            with _download_lock:
+                task = _download_tasks.get(task_id, {})
+                if task.get("cancel_requested") or task.get("status") == "cancelling":
+                    task["status"] = "cancelled"
+                    task["end_time"] = time.time()
+                    task["stop_reason"] = "用户取消采集"
+                    save_json(DOWNLOAD_HISTORY_FILE, history)
+                    return
+                task["current_account_idx"] = acc_idx + 1
+                task["current_account"] = account_name
+                task["current"] = f"正在检索【{account_name}】推文列表..."
+
+            collected_articles = []
+            begin = 0
+            page_size = min(20, max(10, limit))
+
+            while len(collected_articles) < limit:
+                with _download_lock:
+                    task = _download_tasks.get(task_id, {})
+                    if task.get("cancel_requested") or task.get("status") == "cancelling":
+                        task["status"] = "cancelled"
+                        task["end_time"] = time.time()
+                        save_json(DOWNLOAD_HISTORY_FILE, history)
+                        return
+
+                try:
+                    articles, total_count, can_continue = _fetch_articles_page(
+                        fakeid, begin, page_size, keyword="", account_name=account_name
+                    )
+                except Exception as e:
+                    logger.warning(f"[_do_collect_latest] 拉取【{account_name}】列表异常: {e}")
+                    break
+
+                if not articles:
+                    break
+
+                for a in articles:
+                    if len(collected_articles) >= limit:
+                        break
+                    # 避免列表内重复
+                    if not any(ex.get("link") == a.get("link") or (a.get("title") and ex.get("title") == a.get("title")) for ex in collected_articles):
+                        collected_articles.append(a)
+
+                if not can_continue or len(articles) < page_size:
+                    break
+                begin += len(articles)
+                # 微信读书列表翻页平滑间隔（0.5s ~ 0.9s）
+                time.sleep(random.uniform(0.5, 0.9))
+
+            # 遍历下载
+            for a_idx, article in enumerate(collected_articles):
+                with _download_lock:
+                    task = _download_tasks.get(task_id, {})
+                    if task.get("cancel_requested") or task.get("status") == "cancelling":
+                        task["status"] = "cancelled"
+                        task["end_time"] = time.time()
+                        save_json(DOWNLOAD_HISTORY_FILE, history)
+                        return
+                    task["scanned"] += 1
+                    task["total"] += 1
+                    task["current"] = f"【{account_name}】{article.get('title', '')}"
+
+                link = normalize_wechat_short_url(article.get("link", ""))
+                title = article.get("title", f"article_{a_idx+1}")
+
+                # 智能跳过已存在文章
+                if skip_existing:
+                    is_exist = False
+                    existing_path = None
+                    try:
+                        from backend.db import is_article_downloaded
+                        is_exist, existing_path = is_article_downloaded(account_name, link, title)
+                    except Exception:
+                        pass
+
+                    if not is_exist:
+                        for h in history:
+                            if not isinstance(h, dict):
+                                continue
+                            if (h.get("link") and h.get("link") == link) or (h.get("title") and h.get("title") == title and h.get("account") == account_name):
+                                if h.get("success") and h.get("path") and Path(h.get("path")).exists():
+                                    is_exist = True
+                                    existing_path = h.get("path")
+                                    break
+                    if is_exist:
+                        with _download_lock:
+                            task = _download_tasks.get(task_id, {})
+                            task["completed"] += 1
+                            task["current"] = f"【{account_name}】[已跳过] {title}"
+                            task["results"].append({
+                                "title": title, "account": account_name, "success": True, "path": existing_path, "skipped": True
+                            })
+                        continue
+
+                # 未下载过：执行真实下载
+                _download_article_into_task(task_id, article, account_name, history, a_idx)
+
+                # 风控优化：动态随机抖动延迟（1.2s ~ 2.2s）
+                sleep_throttled(max(1.0, delay) + random.uniform(0.3, 0.9), min_delay=1.2)
+
+            save_json(DOWNLOAD_HISTORY_FILE, history)
+
+            # 多公众号流转安全缓冲（2.0s ~ 3.5s），支持即时响应取消请求
+            if acc_idx < len(targets) - 1:
+                sleep_target = random.uniform(2.0, 3.5)
+                slept = 0.0
+                while slept < sleep_target:
+                    with _download_lock:
+                        if _download_tasks.get(task_id, {}).get("cancel_requested"):
+                            break
+                    time.sleep(0.2)
+                    slept += 0.2
+
+        with _download_lock:
+            task = _download_tasks.get(task_id, {})
+            if task.get("cancel_requested") or task.get("status") in ("cancelled", "cancelling"):
+                task["status"] = "cancelled"
+                task["stop_reason"] = task.get("stop_reason") or "用户取消采集"
+                task["current"] = "任务已停止"
+            else:
+                task["status"] = "completed"
+                task["current"] = "采集已完成"
+            task["end_time"] = time.time()
+
+    except Exception as e:
+        save_json(DOWNLOAD_HISTORY_FILE, history)
+        with _download_lock:
+            task = _download_tasks.get(task_id, {})
             task["status"] = "failed"
             task["current"] = ""
             task["stop_reason"] = str(e)

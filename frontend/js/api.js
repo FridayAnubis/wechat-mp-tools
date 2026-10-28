@@ -130,6 +130,12 @@ const API = {
         downloadRange(payload) {
             return API.post('/api/articles/download-range', payload);
         },
+        collectLatest(payload) {
+            return API.post('/api/articles/collect-latest', payload);
+        },
+        collectAll(payload = {}) {
+            return API.post('/api/articles/collect-all', payload);
+        },
         cancelDownload(taskId) {
             return API.post(`/api/articles/download-cancel/${taskId}`);
         },
@@ -293,6 +299,7 @@ const API = {
         auth: {
             status()        { return API.get('/api/xhs-auth/status', { showError: false }); },
             login()         { return API.post('/api/xhs-auth/login'); },
+            cancel()        { return API.post('/api/xhs-auth/cancel'); },
             saveCookie(c)   { return API.post('/api/xhs-auth/save-cookie', { cookie: c }); },
             logout()        { return API.post('/api/xhs-auth/logout'); },
         },

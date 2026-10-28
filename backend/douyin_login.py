@@ -234,7 +234,7 @@ def _do_login():
             
             context = browser.new_context(
                 viewport={'width': 1280, 'height': 800},
-                user_agent="Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+                user_agent="Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36"
             )
             
             # 反爬绕过
@@ -243,7 +243,10 @@ def _do_login():
             page = context.new_page()
             _set_login_state("scanning", "正在打开抖音网页版，请扫码登录...", 30)
             
-            page.goto("https://www.douyin.com/", timeout=60000)
+            try:
+                page.goto("https://www.douyin.com/", wait_until="domcontentloaded", timeout=30000)
+            except Exception:
+                pass
             
             # 点击登录按钮
             try:

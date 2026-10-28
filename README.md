@@ -12,6 +12,8 @@
 
 ### 📱 微信公众号
 - **历史文章全量采集**：完整获取公众号历史文章列表，支持按时间范围与篇数批量拉取。
+- **一键极速采集与增量去重**：支持一键采集单号最新 50 篇推文，或一键串行采集全部关注公众号（各 50 篇），内置本地已下载排重与账号轮换，极大优化风控。
+- **文章列表精准展示**：推文发布时间精确到分钟（`YYYY-MM-DD HH:mm`）；严格识别微信官方版权属性，精准展示「原创」徽章。
 - **高保真多格式导出**：
   - **离线 HTML**：图片、音视频等外部资源本地化保存，离线排版与原文完全一致。
   - **语义 Markdown**：完美适配 Obsidian、Notion 等知识管理软件。
@@ -21,6 +23,7 @@
   - 为每个公众号生成独立专属 Feed，支持全聚合 Feed。
   - 支持后台定时增量抓取、全文/摘要输出模式、访问令牌（Token）鉴权与 ETag 缓存机制。
 - **智能风控防护与错误码自愈**：深度适配上游网关策略，内置人机验证与瞬时频控（-2014）自动退避重试、网关超时（-2012）自动重放与会话休眠（-2041）自愈通道，遭遇风控时自动冷却防封并联动网页滑块验证，全链路保障账号安全。
+- **数据库多引擎支持**：默认内置零配置 SQLite（`data/wechat_tools.db`），支持一键无缝配置远程 MySQL 存储，且自带平滑容灾回退能力。
 
 ### 🎥 微信视频号
 - **单视频解析下载**：粘贴分享链接一键无水印下载高清视频。
@@ -55,25 +58,56 @@
 
 ## 🐳 Docker 部署（服务端 / NAS / VPS）
 
-本项目已全面支持容器化部署，提供轻量版（专注公众号 + RSS）与全功能版两种运行形态。
+本项目全面支持容器化部署，提供轻量版（专注公众号 + RSS）与全功能版两种运行形态。
 
-### 1. 快速启动（默认公众号 + RSS 独立服务）
+### 1. ⚡ 一键极速部署（推荐）
 
+#### 方式 A：Docker CLI 一行命令启动（开箱即用）
+无需先配置复杂的环境或目录，只需执行一行命令即可在后台启动：
 ```bash
-# 1. 克隆代码进入部署目录
+docker run -d \
+  --name wechat-mp-tools \
+  --restart unless-stopped \
+  -p 5200:5200 \
+  -v $(pwd)/data:/app/data \
+  -e TZ=Asia/Shanghai \
+  -e BIND_ADDR=0.0.0.0 \
+  -e DB_TYPE=sqlite \
+  ghcr.io/x554960766/wechat-mp-tools:latest
+```
+
+#### 方式 B：Docker Compose 一键构建与启动
+```bash
+# 1. 克隆代码进入部署目录并一键启动
 git clone https://github.com/x554960766/wechat-mp-tools.git
 cd wechat-mp-tools/deploy/docker
-
-# 2. 准备配置文件与数据目录
-cp .env.example .env
-mkdir -p data
-
-# 3. 启动容器
+cp -n .env.example .env && mkdir -p data
 docker compose up -d --build
 ```
 启动完成后，在浏览器中访问：`http://<服务器IP>:5200` 即可开始使用。
 
-### 2. 镜像形态切换说明
+---
+
+### 2. 🗄️ 数据库配置（SQLite 与 MySQL）
+
+系统默认采用 **SQLite**（文件位于 `data/wechat_tools.db`），零配置、零依赖，启动时会自动建表并自动同步存量历史记录。
+
+若在群晖 NAS、服务器集群或多容器中希望使用 **MySQL**，只需在 `.env` 或环境变量中配置即可自动切换：
+
+```ini
+# 启用 MySQL 数据库存储
+DB_TYPE=mysql
+DB_HOST=192.168.1.100
+DB_PORT=3306
+DB_USER=root
+DB_PASSWORD=your_password
+DB_NAME=wechat_tools
+```
+*提示：系统具备平滑容灾降级机制，若远程 MySQL 暂时失联，会自动平滑回退至本地 SQLite 保护业务不中断。*
+
+---
+
+### 3. 镜像形态切换说明
 
 编辑 `deploy/docker/.env` 文件可灵活切换部署形态：
 
@@ -83,13 +117,14 @@ docker compose up -d --build
 | **全功能版** | `DOCKERFILE=deploy/docker/Dockerfile.full`<br>`IMAGE=wechat-mp-tools-full:latest` | 包含所有平台功能（公众号 + 抖音 + 快手 + 小红书 + B站 + 视频号 + 转码工具）。 |
 | **PDF 导出支持** | `INSTALL_BROWSERS=1` | 安装 Chromium 内核以启用公众号文章导出为 PDF 功能（体积增大约 1.5GB）。 |
 
-### 3. 数据持久化与常用参数
+### 4. 数据持久化与常用参数
 
 容器运行仅需持久化挂载 `./data` 目录（存放登录凭据、系统配置、下载历史、RSS 缓存及下载文章）：
 - `PORT`：服务端监听端口（默认 `5200`）
 - `BIND_ADDR`：绑定地址（如需局域网或公网直接访问可设为 `0.0.0.0`，默认 `127.0.0.1` 配合 Nginx 反向代理）
 - `RSS_TOKEN`：可选，为 RSS 订阅源设置访问密钥（如 `?token=your_secret`）
 - `RSS_BASE_URL`：可选，反向代理时指定对外公开的 RSS 基准网址
+- `DB_TYPE`：数据库引擎类型（`sqlite` 或 `mysql`，默认 `sqlite`）
 
 ---
 

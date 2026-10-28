@@ -86,6 +86,28 @@ def host_path_hint(path) -> str:
 
 
 def configure_runtime():
+    # 修复在守护进程或终端关闭后 stdout/stderr 写入导致的 [Errno 5] Input/output error
+    class _SafeStream:
+        def __init__(self, stream):
+            self._stream = stream
+        def write(self, data):
+            try:
+                return self._stream.write(data)
+            except OSError:
+                pass
+        def flush(self):
+            try:
+                return self._stream.flush()
+            except OSError:
+                pass
+        def __getattr__(self, name):
+            return getattr(self._stream, name)
+
+    if sys.stdout and not isinstance(sys.stdout, _SafeStream):
+        sys.stdout = _SafeStream(sys.stdout)
+    if sys.stderr and not isinstance(sys.stderr, _SafeStream):
+        sys.stderr = _SafeStream(sys.stderr)
+
     # 修复在 Windows / 临时解压目录（如 360zip / PyInstaller）运行时，
     # 环境变量 REQUESTS_CA_BUNDLE / SSL_CERT_FILE / CURL_CA_BUNDLE 指向已失效临时路径导致的 TLS 证书报错
     for env_var in ("REQUESTS_CA_BUNDLE", "CURL_CA_BUNDLE", "SSL_CERT_FILE"):
@@ -163,6 +185,30 @@ def _system_browser_channels() -> list[str]:
     return ["chrome", "msedge"]
 
 
+def activate_macos_browser():
+    """在 macOS 下将新启动的浏览器窗口置顶激活，避免后台启动让用户以为卡住"""
+    if sys.platform != "darwin":
+        return
+    import threading
+    def _run():
+        import subprocess
+        import time
+        time.sleep(0.5)
+        try:
+            script = '''
+            tell application "System Events"
+                set pList to every process whose name contains "Chrome" or name contains "Chromium" or name contains "Edge"
+                if (count of pList) > 0 then
+                    set frontmost of item 1 of pList to true
+                end if
+            end tell
+            '''
+            subprocess.run(["osascript", "-e", script], capture_output=True, timeout=2)
+        except Exception:
+            pass
+    threading.Thread(target=_run, daemon=True).start()
+
+
 def launch_chromium(chromium, **launch_kwargs):
     """Launch bundled Chromium when present, otherwise fall back to system browsers."""
     attempts = []
@@ -189,7 +235,10 @@ def launch_chromium(chromium, **launch_kwargs):
         kwargs = launch_kwargs.copy()
         kwargs.update(override)
         try:
-            return chromium.launch(**kwargs)
+            browser = chromium.launch(**kwargs)
+            if not kwargs.get("headless", False):
+                activate_macos_browser()
+            return browser
         except Exception as exc:
             last_error = exc
 
@@ -225,7 +274,10 @@ def launch_persistent_context(chromium, user_data_dir, **launch_kwargs):
         kwargs = launch_kwargs.copy()
         kwargs.update(override)
         try:
-            return chromium.launch_persistent_context(str(user_data_dir), **kwargs)
+            ctx = chromium.launch_persistent_context(str(user_data_dir), **kwargs)
+            if not kwargs.get("headless", False):
+                activate_macos_browser()
+            return ctx
         except Exception as exc:
             last_error = exc
 

@@ -15,12 +15,13 @@ xhs_login_bp = Blueprint("xhs_login", __name__, url_prefix="/api/xhs-auth")
 
 # ── 登录状态管理 ──────────────────────────────────────────
 _xhs_login_state = {
-    "status": "idle",       # idle / scanning / success / failed
+    "status": "idle",       # idle / scanning / success / failed / cancelled
     "message": "",
     "progress": 0,
 }
 _xhs_login_lock = threading.Lock()
 _active_browser = None
+_cancel_event = threading.Event()
 
 def _set_login_state(status: str, message: str = "", progress: int = 0):
     with _xhs_login_lock:
@@ -30,6 +31,7 @@ def _set_login_state(status: str, message: str = "", progress: int = 0):
 
 def _do_login():
     global _active_browser
+    _cancel_event.clear()
     
     with _xhs_login_lock:
         if _active_browser is not None:
@@ -43,22 +45,52 @@ def _do_login():
     
     try:
         with sync_playwright() as p:
-            browser = launch_chromium(p.chromium, headless=False, args=['--disable-blink-features=AutomationControlled'])
+            if _cancel_event.is_set():
+                _set_login_state("cancelled", "登录已取消", 0)
+                return
+
+            browser = launch_chromium(
+                p.chromium, headless=False,
+                args=[
+                    '--disable-blink-features=AutomationControlled',
+                    '--no-sandbox',
+                    '--disable-setuid-sandbox',
+                    '--disable-infobars',
+                    '--ignore-certificate-errors',
+                ]
+            )
             _active_browser = browser
+
+            if _cancel_event.is_set():
+                try:
+                    browser.close()
+                except Exception:
+                    pass
+                _active_browser = None
+                _set_login_state("cancelled", "登录已取消", 0)
+                return
             
             context = browser.new_context(
                 viewport={'width': 1280, 'height': 800},
-                user_agent=XhsClient.USER_AGENT
+                user_agent="Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36",
+                locale="zh-CN",
+                timezone_id="Asia/Shanghai"
             )
-            
-            context.add_init_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined}); Object.defineProperty(navigator, 'platform', {get: () => 'Win32'})")
-            
             page = context.new_page()
+            try:
+                from playwright_stealth import Stealth
+                Stealth().apply_stealth_sync(page)
+            except Exception:
+                pass
+            
             _set_login_state("scanning", "正在打开小红书主页，请扫码登录...", 30)
             
-            page.goto("https://www.xiaohongshu.com", timeout=60000)
+            try:
+                page.goto("https://www.xiaohongshu.com", wait_until="domcontentloaded", timeout=45000)
+            except Exception:
+                pass
             
-            _set_login_state("scanning", "请在弹出的浏览器中完成扫码或验证码登录", 50)
+            _set_login_state("scanning", "请在弹出的浏览器中完成扫码登录（若出现滑块验证，可直接在浏览器中滑动）", 50)
 
             # 记录初始（游客）web_session，登录成功后该值会变化；变化后用 /user/me 网络确认是否真登录。
             # 不能只看 web_session 是否存在——小红书对游客也下发 web_session。
@@ -69,6 +101,8 @@ def _do_login():
             login_success = False
             cookie_str = ""
             for _ in range(80):  # 80 * 3 = 240 秒
+                if _cancel_event.is_set():
+                    break
                 if not browser.is_connected():
                     break
 
@@ -98,7 +132,9 @@ def _do_login():
                                 break
                 time.sleep(3)
 
-            if login_success:
+            if _cancel_event.is_set():
+                _set_login_state("cancelled", "登录已取消", 0)
+            elif login_success:
                 _set_login_state("scanning", "登录成功，正在提取 Cookie...", 90)
 
                 settings = get_settings()
@@ -109,7 +145,7 @@ def _do_login():
             else:
                 _set_login_state("failed", "登录超时或浏览器被关闭，未检测到 Cookie", 0)
                 
-            time.sleep(2)
+            time.sleep(1)
             try:
                 browser.close()
             except Exception:
@@ -117,7 +153,10 @@ def _do_login():
             _active_browser = None
             
     except Exception as e:
-        _set_login_state("failed", f"登录异常: {str(e)}", 0)
+        if _cancel_event.is_set():
+            _set_login_state("cancelled", "登录已取消", 0)
+        else:
+            _set_login_state("failed", f"登录异常: {str(e)}", 0)
         if _active_browser:
             try:
                 _active_browser.close()
@@ -155,6 +194,20 @@ def start_login():
     thread = threading.Thread(target=_do_login, daemon=True)
     thread.start()
     return jsonify({"message": "已启动登录流程，请在弹出的浏览器窗口中扫码"})
+
+@xhs_login_bp.route("/cancel", methods=["POST"])
+def cancel_login():
+    global _active_browser
+    _cancel_event.set()
+    with _xhs_login_lock:
+        if _active_browser:
+            try:
+                _active_browser.close()
+            except Exception:
+                pass
+            _active_browser = None
+    _set_login_state("cancelled", "登录已取消", 0)
+    return jsonify({"message": "登录流程已取消"})
 
 @xhs_login_bp.route("/save-cookie", methods=["POST"])
 def save_cookie_manually():

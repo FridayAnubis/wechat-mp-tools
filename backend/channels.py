@@ -293,10 +293,13 @@ def _do_cookie_acquisition():
             browser = launch_chromium(p.chromium, headless=False)
             
             context = browser.new_context(
-                user_agent="Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+                user_agent="Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36"
             )
             page = context.new_page()
-            page.goto("https://yuanbao.tencent.com/")
+            try:
+                page.goto("https://yuanbao.tencent.com/", wait_until="domcontentloaded", timeout=30000)
+            except Exception:
+                pass
             
             cookie_captured = None
             start_time = time.time()

@@ -408,7 +408,16 @@ class DouyinClient:
                         continue
                     raise ValueError("未获取到有效数据。请检查是否已在左侧菜单「扫码登录」并获取有效 Cookie。")
                     
-                return resp.json()
+                try:
+                    return resp.json()
+                except Exception:
+                    if b"\xe6\x9a\x82\xe6\x97\xb6\xe6\xb2\xa1\xe6\x9c\x89\xe6\x9b\xb4\xe5\xa4\x9a\xe4\xba\x86" in resp.content or "application/x-protobuf" in resp.headers.get("content-type", ""):
+                        return {"status_code": 0, "aweme_list": [], "has_more": False}
+                    if attempt == 0:
+                        _add_log("⚠️ 抖音接口返回非 JSON 数据，重试刷新凭证...")
+                        self.ensure_ttwid_cookie(force_refresh=True)
+                        continue
+                    raise ValueError("抖音接口返回非 JSON 数据，请确认是否已在左侧菜单「扫码登录」并获取有效 Cookie。")
             except ValueError as ve:
                 raise Exception(str(ve))
             except Exception as e:
@@ -438,10 +447,8 @@ class DouyinClient:
                         resp = self.session.post(url, params=all_params, data=data, timeout=timeout)
                 else:
                     if uifid:
-                        qs = urllib.parse.urlencode(all_params)
-                        full_req_url = f"{url}?{qs}" if qs else url
-                        full_req_url = sign_secsdk_url(full_req_url, uifid=uifid)
-                        resp = self.session.post(full_req_url, timeout=timeout)
+                        full_req_url = sign_secsdk_url(url, uifid=uifid)
+                        resp = self.session.post(full_req_url, data=all_params, timeout=timeout)
                     else:
                         resp = self.session.post(url, data=all_params, timeout=timeout)
 
@@ -459,7 +466,16 @@ class DouyinClient:
                         continue
                     raise ValueError("未获取到有效数据。请检查是否已在左侧菜单「扫码登录」并获取有效 Cookie。")
                     
-                return resp.json()
+                try:
+                    return resp.json()
+                except Exception:
+                    if b"\xe6\x9a\x82\xe6\x97\xb6\xe6\xb2\xa1\xe6\x9c\x89\xe6\x9b\xb4\xe5\xa4\x9a\xe4\xba\x86" in resp.content or "application/x-protobuf" in resp.headers.get("content-type", ""):
+                        return {"status_code": 0, "aweme_list": [], "has_more": False}
+                    if attempt == 0:
+                        _add_log("⚠️ 抖音接口返回非 JSON 数据，重试刷新凭证...")
+                        self.ensure_ttwid_cookie(force_refresh=True)
+                        continue
+                    raise ValueError("抖音接口返回非 JSON 数据，请确认是否已在左侧菜单「扫码登录」并获取有效 Cookie。")
             except ValueError as ve:
                 raise Exception(str(ve))
             except Exception as e:
@@ -4088,6 +4104,15 @@ def api_feed():
     try:
         api = DouyinClient()
         res = api.get_recommended_feed(count, cursor)
+        if isinstance(res, dict):
+            if res.get("aweme_list") is None:
+                res["aweme_list"] = []
+            if res.get("has_more") is not None:
+                res["has_more"] = res["has_more"] if isinstance(res["has_more"], bool) else int(res["has_more"]) == 1
+            else:
+                res["has_more"] = False
+            if res.get("max_cursor") is None:
+                res["max_cursor"] = res.get("cursor") or 0
         return jsonify(res)
     except Exception as e:
         return jsonify({"error": str(e)}), 500

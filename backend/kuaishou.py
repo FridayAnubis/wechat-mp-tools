@@ -42,7 +42,7 @@ ACCOUNTS_FILE = DATA_DIR / "kuaishou_accounts.json"
 USER_AGENT = (
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
     "AppleWebKit/537.36 (KHTML, like Gecko) "
-    "Chrome/126.0.0.0 Safari/537.36"
+    "Chrome/133.0.0.0 Safari/537.36"
 )
 
 # 快手 API 端点
@@ -499,7 +499,10 @@ class KuaishouClient:
         result = latest_data.get("result")
         if result == 109 or latest_data.get("loginUrl"):
             _notify_login_expired(True)
-            raise Exception("加载更多作品需要快手登录凭证，请在左侧点击「扫码登录」登录快手后重试。")
+            if not pcursor:
+                raise Exception("获取快手用户作品列表需要快手登录凭证（快手官方对主页作品列表开启了鉴权与风控限制）。请在左侧点击「扫码登录」登录快手账号后重试。")
+            else:
+                raise Exception("加载更多作品需要快手登录凭证，请在左侧点击「扫码登录」登录快手后重试。")
 
         if "feeds" not in latest_data and result not in (1, None):
             raise Exception(f"获取用户作品列表失败 (result={result})。请确认已扫码登录，且该主页作品公开。")
@@ -525,7 +528,10 @@ class KuaishouClient:
         cookie_str = settings.get("kuaishou_cookie", "").strip()
         if not cookie_str:
             _notify_login_expired(True)
-            raise Exception("未登录快手。获取用户作品列表需要快手登录凭证，请先在左侧「扫码登录」登录快手。")
+            if not pcursor:
+                raise Exception("未登录快手。获取快手用户作品列表需要快手登录凭证（快手官方对主页作品列表开启了鉴权与风控限制），请先在左侧点击「扫码登录」登录快手后重试。")
+            else:
+                raise Exception("未登录快手。获取更多作品需要快手登录凭证，请先在左侧「扫码登录」登录快手。")
 
         try:
             self._prime(f"https://www.kuaishou.com/profile/{user_id}")

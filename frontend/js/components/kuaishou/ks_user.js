@@ -117,7 +117,18 @@ const KsUserPage = {
             document.getElementById('ks-user-list-card').style.display = 'block';
             if (this.items.length === 0) Toast.show('该主页暂无公开作品', 'info');
         } catch (err) {
-            Toast.show(err.message, 'error');
+            const msg = err.message || '';
+            if (msg.includes('登录凭证') || msg.includes('扫码登录') || msg.includes('未登录')) {
+                Modal.confirm(
+                    '需要扫码登录快手',
+                    '快手官方现已限制用户主页作品浏览需要快手账号登录凭证。<br><br>当前快手尚未登录或登录已失效，是否立即前往扫码登录？',
+                    () => {
+                        Router.navigate('ks_login');
+                    }
+                );
+            } else {
+                Toast.show(msg, 'error');
+            }
         } finally {
             btn.disabled = false;
             btn.textContent = '加载列表';

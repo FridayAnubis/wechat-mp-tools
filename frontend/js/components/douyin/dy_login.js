@@ -145,7 +145,8 @@ const DyLoginComponent = {
     async startLogin() {
         try {
             this.startBtn.disabled = true;
-            this.cancelBtn.style.display = 'none';
+            this.cancelBtn.style.display = 'inline-flex';
+            this.cancelBtn.disabled = false;
             this.statusText.textContent = "正在初始化浏览器，请稍候...";
             this.statusText.style.color = "var(--text-primary)";
             this.loginHint.style.display = 'none';
@@ -153,17 +154,15 @@ const DyLoginComponent = {
             const res = await API.douyin.auth.start();
             Toast.show(res.message, 'success');
 
-            // 显示取消按钮
-            this.cancelBtn.style.display = 'inline-flex';
-
-            // 启动轮询
+            // 启动轮询并立即检查一次状态
             if (this.statusTimer) clearInterval(this.statusTimer);
-            this.statusTimer = setInterval(() => this.checkStatus(), 2000);
+            this.statusTimer = setInterval(() => this.checkStatus(), 1500);
+            this.checkStatus();
         } catch (err) {
             Toast.show(err.message, 'error');
             this.startBtn.disabled = false;
             this.cancelBtn.style.display = 'none';
-            this.statusText.textContent = "启动失败，请重试";
+            this.statusText.textContent = "启动失败: " + err.message;
             this.statusText.style.color = "var(--error)";
         }
     },

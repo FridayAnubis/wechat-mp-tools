@@ -25,8 +25,11 @@ const ArticlesPage = {
 
             <!-- 公众号选择器 -->
             <div class="card" style="margin-bottom: var(--spacing-lg);">
-                <div class="card-header">
+                <div class="card-header" style="display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 8px;">
                     <h3 class="card-title">📌 选择公众号</h3>
+                    <button class="btn btn-warning btn-sm" onclick="ArticlesPage.collectAllAccounts()" title="一键按顺序采集所有已关注公众号最近50篇推文（自动跳过已下载存量，深度优化风控）">
+                        ⚡ 全部关注公众号一键采集 (各50篇)
+                    </button>
                 </div>
                 <div id="account-selector" style="display: flex; flex-wrap: wrap; gap: 8px;">
                     <div class="spinner" style="margin: 0 auto;"></div>
@@ -58,7 +61,18 @@ const ArticlesPage = {
                         <input type="date" class="form-input" id="article-start-date">
                         <span class="article-date-separator">至</span>
                         <input type="date" class="form-input" id="article-end-date">
+                        <select class="form-input" id="article-quick-date" onchange="ArticlesPage.onQuickDateChange(this.value)" style="width: auto; padding: 4px 8px; font-size: 0.85rem; cursor: pointer;">
+                            <option value="">快捷日期 ▾</option>
+                            <option value="today">今天</option>
+                            <option value="3days">近3天</option>
+                            <option value="7days">近7天</option>
+                            <option value="30days">近30天</option>
+                            <option value="this_month">本月</option>
+                        </select>
                         <button class="btn btn-primary btn-sm" onclick="ArticlesPage.downloadDateRange()">按时间下载</button>
+                        <button class="btn btn-warning btn-sm" onclick="ArticlesPage.collectCurrentAccount()" title="一键采集当前公众号最近50篇推文（自动跳过已下载，保护风控）">
+                            ⚡ 采集最新50篇
+                        </button>
                         <button class="btn btn-secondary btn-sm" onclick="ArticlesPage.clearDateFilter()">重置</button>
                         
                         <!-- 多选操作控制按钮组 -->
@@ -337,12 +351,22 @@ const ArticlesPage = {
             return;
         }
 
+        const formatArticleTime = (ts) => {
+            if (!ts) return '';
+            const d = new Date(ts * 1000);
+            if (isNaN(d.getTime())) return '';
+            const y = d.getFullYear();
+            const m = String(d.getMonth() + 1).padStart(2, '0');
+            const day = String(d.getDate()).padStart(2, '0');
+            const hh = String(d.getHours()).padStart(2, '0');
+            const mm = String(d.getMinutes()).padStart(2, '0');
+            return `${y}-${m}-${day} ${hh}:${mm}`;
+        };
+
         container.innerHTML = this.articles.map((article, idx) => {
             const globalIdx = this.currentPage * this.pageSize + idx;
             const isSelected = this.selectedArticles.has(globalIdx);
-            const time = article.update_time
-                ? new Date(article.update_time * 1000).toLocaleDateString('zh-CN')
-                : '';
+            const time = formatArticleTime(article.update_time);
 
             return `
                 <div class="article-item ${isSelected ? 'selected' : ''}" data-idx="${globalIdx}" onclick="ArticlesPage.handleArticleClick(${globalIdx}, ${idx}, event)">
@@ -480,14 +504,62 @@ const ArticlesPage = {
         this.loadArticles();
     },
 
+    onQuickDateChange(type) {
+        if (!type) return;
+        const now = new Date();
+        const startInput = document.getElementById('article-start-date');
+        const endInput = document.getElementById('article-end-date');
+        if (!startInput || !endInput) return;
+
+        const fmt = d => {
+            const year = d.getFullYear();
+            const month = String(d.getMonth() + 1).padStart(2, '0');
+            const day = String(d.getDate()).padStart(2, '0');
+            return `${year}-${month}-${day}`;
+        };
+        const endStr = fmt(now);
+        let startStr = endStr;
+
+        if (type === 'today') {
+            startStr = endStr;
+        } else if (type === '3days') {
+            const d = new Date(now.getTime() - 2 * 86400000);
+            startStr = fmt(d);
+        } else if (type === '7days') {
+            const d = new Date(now.getTime() - 6 * 86400000);
+            startStr = fmt(d);
+        } else if (type === '30days') {
+            const d = new Date(now.getTime() - 29 * 86400000);
+            startStr = fmt(d);
+        } else if (type === 'this_month') {
+            const d = new Date(now.getFullYear(), now.getMonth(), 1);
+            startStr = fmt(d);
+        }
+
+        startInput.value = startStr;
+        endInput.value = endStr;
+    },
+
     getDateRange() {
         const startVal = document.getElementById('article-start-date')?.value;
         const endVal = document.getElementById('article-end-date')?.value;
-        if (!startVal || !endVal) {
+        if (!startVal && !endVal) {
             return null;
         }
-        const startTimestamp = Math.floor(new Date(startVal + 'T00:00:00').getTime() / 1000);
-        const endTimestamp = Math.floor(new Date(endVal + 'T23:59:59').getTime() / 1000);
+        const now = new Date();
+        const year = now.getFullYear();
+        const month = String(now.getMonth() + 1).padStart(2, '0');
+        const day = String(now.getDate()).padStart(2, '0');
+        const todayStr = `${year}-${month}-${day}`;
+
+        const effectiveStart = startVal || '2000-01-01';
+        const effectiveEnd = endVal || todayStr;
+
+        const startTimestamp = Math.floor(new Date(effectiveStart + 'T00:00:00').getTime() / 1000);
+        const endTimestamp = Math.floor(new Date(effectiveEnd + 'T23:59:59').getTime() / 1000);
+        if (isNaN(startTimestamp) || isNaN(endTimestamp)) {
+            return { error: '日期格式不正确' };
+        }
         if (startTimestamp > endTimestamp) {
             return { error: '开始日期不能晚于结束日期' };
         }
@@ -497,8 +569,48 @@ const ArticlesPage = {
     clearDateFilter() {
         const startInput = document.getElementById('article-start-date');
         const endInput = document.getElementById('article-end-date');
+        const quickSelect = document.getElementById('article-quick-date');
         if (startInput) startInput.value = '';
         if (endInput) endInput.value = '';
+        if (quickSelect) quickSelect.value = '';
+    },
+
+    async collectCurrentAccount(limit = 50) {
+        if (!this.currentFakeid) {
+            Toast.warning('请先选择要采集的公众号');
+            return;
+        }
+        if (!confirm(`确定一键采集【${this.currentName || '当前公众号'}】最近 ${limit} 篇推文吗？\n\n📌 保护机制：系统会自动跳过本地已下载的推文，仅抓取最新增量，保护风控。`)) {
+            return;
+        }
+        try {
+            const data = await API.articles.collectLatest({
+                fakeid: this.currentFakeid,
+                account_name: this.currentName,
+                limit: limit,
+                skip_existing: true
+            });
+            Toast.info(data.message || '已启动一键采集任务');
+            this.startTask(data);
+        } catch (err) {
+            Toast.error(`启动一键采集失败: ${err.message}`);
+        }
+    },
+
+    async collectAllAccounts(limit = 50) {
+        if (!confirm(`确定一键采集【全部已关注公众号】各最近 ${limit} 篇推文吗？\n\n📌 运行说明：\n1. 系统将自动按顺序依次采集每个公众号；\n2. 已下载文章自动秒级跳过，杜绝重复网络请求与风控封控；\n3. 多号流转内置 2~3 秒平滑缓冲间隔。`)) {
+            return;
+        }
+        try {
+            const data = await API.articles.collectAll({
+                limit: limit,
+                skip_existing: true
+            });
+            Toast.info(data.message || '已启动全量一键采集任务');
+            this.startTask(data);
+        } catch (err) {
+            Toast.error(`启动全量采集失败: ${err.message}`);
+        }
     },
 
     updatePagination() {
@@ -631,7 +743,11 @@ const ArticlesPage = {
         const progress = total > 0 ? Math.round(((completed + failed) / total) * 100) : 0;
 
         document.getElementById('download-progress-bar').style.width = `${progress}%`;
-        document.getElementById('download-current').textContent = task.current || '-';
+        let currentText = task.current || '-';
+        if (task.total_accounts && task.current_account_idx) {
+            currentText = `[${task.current_account_idx}/${task.total_accounts}] ${currentText}`;
+        }
+        document.getElementById('download-current').textContent = currentText;
         document.getElementById('download-completed').textContent = completed;
         document.getElementById('download-failed').textContent = failed;
         document.getElementById('download-total').textContent = total;

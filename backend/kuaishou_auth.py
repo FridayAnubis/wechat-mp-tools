@@ -3,6 +3,8 @@
 参考 douyin_auth 的实现方式，登录后保存 .kuaishou.com 域 Cookie
 """
 import re
+import sys
+import subprocess
 import time
 import threading
 from flask import Blueprint, jsonify
@@ -91,21 +93,12 @@ def start_login():
 @kuaishou_auth_bp.route("/cancel", methods=["POST"])
 def cancel_login():
     """取消正在进行的登录"""
-    global _active_browser, _cancel_event
+    global _cancel_event
 
     if _login_state["status"] != "scanning":
         return jsonify({"error": "没有正在进行的登录"}), 400
 
     _cancel_event.set()
-
-    with _login_lock:
-        if _active_browser is not None:
-            try:
-                _active_browser.close()
-            except Exception:
-                pass
-            _active_browser = None
-
     _set_state("cancelled", "登录已取消")
     return jsonify({"message": "已取消登录"})
 
@@ -155,6 +148,10 @@ def _do_login():
 
     try:
         with sync_playwright() as p:
+            if _cancel_event.is_set():
+                _set_state("cancelled", "登录已取消")
+                return
+
             browser = launch_chromium(
                 p.chromium,
                 headless=False,
@@ -162,15 +159,35 @@ def _do_login():
             )
             _active_browser = browser
 
+            if _cancel_event.is_set():
+                try:
+                    browser.close()
+                except Exception:
+                    pass
+                _active_browser = None
+                _set_state("cancelled", "登录已取消")
+                return
+
             context = browser.new_context(
-                user_agent="Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
+                user_agent="Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36",
                 viewport={"width": 1280, "height": 800}
             )
             context.add_init_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
 
             page = context.new_page()
-            _set_state("scanning", "正在打开快手登录页面，请扫码登录...")
-            page.goto("https://www.kuaishou.com/", timeout=60000)
+            _set_state("scanning", "正在打开快手登录页面，请稍候...")
+
+            if sys.platform == "darwin":
+                try:
+                    subprocess.run(
+                        ["osascript", "-e", 'tell application "Google Chrome" to activate'],
+                        capture_output=True,
+                        timeout=3
+                    )
+                except Exception:
+                    pass
+
+            page.goto("https://www.kuaishou.com/", wait_until="domcontentloaded", timeout=45000)
 
             _set_state("scanning", "请在浏览器窗口中完成扫码登录")
 

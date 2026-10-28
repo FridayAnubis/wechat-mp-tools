@@ -15,7 +15,7 @@ from pathlib import Path
 from backend.runtime import app_dir
 
 # ── 版本号 ────────────────────────────────────────────────
-APP_VERSION = "2.3.4"
+APP_VERSION = "2.3.5"
 
 # ── 路径配置 ──────────────────────────────────────────────
 if getattr(sys, 'frozen', False):
@@ -72,13 +72,26 @@ DEFAULT_SETTINGS = {
     "rss_local_avatar": True,
     "rss_avatar_from_article": True,
     "weread_platform_url": WEREAD_PLATFORM_URL,
+    # ── 数据库配置 ──────────────────────────────────────────
+    "db_type": os.environ.get("DB_TYPE", "sqlite"),  # "sqlite", "mysql", "json"
+    "db_sqlite_path": os.environ.get("DB_SQLITE_PATH", str(DATA_DIR / "wechat_tools.db")),
+    "db_host": os.environ.get("DB_HOST", "127.0.0.1"),
+    "db_port": int(os.environ.get("DB_PORT", 3306)),
+    "db_user": os.environ.get("DB_USER", "root"),
+    "db_password": os.environ.get("DB_PASSWORD", ""),
+    "db_name": os.environ.get("DB_NAME", "wechat_tools"),
 }
 
 
 def ensure_dirs():
-    """确保必要的目录存在"""
+    """确保必要的目录存在并初始化底层数据库"""
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    try:
+        from backend.db import init_db
+        init_db()
+    except Exception:
+        pass
 
 
 def load_json(filepath: Path, default=None):

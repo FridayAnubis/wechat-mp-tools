@@ -38,7 +38,10 @@ const XhsLoginPage = {
             </div>
 
             <div class="card" style="padding: 24px; background: var(--bg-card); border: 1px solid var(--border-color); border-radius: 12px;">
-                <h3 style="margin-bottom: 12px; color: var(--text-primary);">如何获取小红书 Cookie？</h3>
+                <h3 style="margin-bottom: 12px; color: var(--text-primary);">💡 防风控提示与如何获取 Cookie</h3>
+                <div style="background: var(--bg-secondary); border-radius: 8px; padding: 12px 16px; margin-bottom: 16px; font-size: 0.85rem; color: var(--text-secondary); line-height: 1.6;">
+                    🛡️ <strong>防风控机制已启用：</strong>系统内置反反爬 Stealth 隐匿伪装。扫码登录成功获取的 Cookie 有效期可长达数月至一年；若在弹出的浏览器中偶遇滑块验证，直接在浏览器窗口中完成手动滑动即可解除拦截。
+                </div>
                 <ol style="color: var(--text-secondary); padding-left: 20px; line-height: 1.8; font-size: 0.9rem;">
                     <li>在电脑浏览器（如 Chrome）中打开并登录 <a href="https://www.xiaohongshu.com" target="_blank" style="color: var(--primary); font-weight: 500;">小红书网页版</a>。</li>
                     <li>按键盘上的 <strong>F12</strong> 或右键选择“检查”打开开发者工具。</li>
@@ -144,6 +147,7 @@ const XhsLoginPage = {
                             <div class="progress-bar" style="width: 60%; margin: 12px auto; background: var(--bg-tertiary); height: 8px; border-radius: 4px; overflow: hidden;">
                                 <div class="progress-fill" style="width: ${loginState.progress}%; background: var(--primary); height: 100%;"></div>
                             </div>
+                            <button class="btn btn-secondary btn-sm" style="margin-top: 10px;" onclick="XhsLoginPage.cancelLogin()">取消登录</button>
                         </div>
                     `;
                 } else if (loginState.status === 'success') {
@@ -160,10 +164,11 @@ const XhsLoginPage = {
                         container.innerHTML = '';
                         App.checkAuthStatus();
                     }, 2000);
-                } else if (loginState.status === 'failed') {
+                } else if (loginState.status === 'failed' || loginState.status === 'cancelled') {
+                    const isCancelled = loginState.status === 'cancelled';
                     container.innerHTML = `
-                        <div style="background: rgba(255,59,48,0.05); border: 1px solid rgba(255,59,48,0.2); border-radius: 12px; padding: 20px; text-align: center;">
-                            <p style="color: var(--error); font-weight: 600;">❌ 登录失败: ${loginState.message}</p>
+                        <div style="background: ${isCancelled ? 'var(--bg-secondary)' : 'rgba(255,59,48,0.05)'}; border: 1px solid ${isCancelled ? 'var(--border-color)' : 'rgba(255,59,48,0.2)'}; border-radius: 12px; padding: 20px; text-align: center;">
+                            <p style="color: ${isCancelled ? 'var(--text-secondary)' : 'var(--error)'}; font-weight: 600;">${isCancelled ? 'ℹ️ 登录已取消' : '❌ 登录失败: ' + loginState.message}</p>
                             <button class="btn btn-primary btn-sm" style="margin-top: 12px;" onclick="XhsLoginPage.startLogin()">重新登录</button>
                         </div>
                     `;
@@ -180,6 +185,22 @@ const XhsLoginPage = {
                 // ignore
             }
         }, 2000);
+    },
+
+    async cancelLogin() {
+        try {
+            await API.xhs.auth.cancel();
+            Toast.info('已取消登录');
+        } catch (err) {
+            Toast.error('取消失败: ' + err.message);
+        }
+        if (this._pollTimer) {
+            clearInterval(this._pollTimer);
+            this._pollTimer = null;
+        }
+        this._resetLoginButton();
+        const container = document.getElementById('xhs-scan-status-container');
+        if (container) container.innerHTML = '';
     },
 
     _resetLoginButton() {

@@ -5,7 +5,7 @@ const KsLoginComponent = {
         return `
             <div class="page-header">
                 <h2 class="page-title">快手登录与凭证管理</h2>
-                <p style="color: var(--text-secondary); margin-top: 8px;">快手模块核心功能（单作品解析、作者档案解析、主页作品浏览与批量下载）<strong>均已支持免登录直接使用</strong>。</p>
+                <p style="color: var(--text-secondary); margin-top: 8px;">快手单作品解析支持<strong>免登录直接使用</strong>；获取作者主页全部作品列表受快手官方风控限制，需在此扫码登录快手账号。</p>
             </div>
 
             <div class="card login-card" style="max-width: 540px; margin: 30px auto; text-align: center;">
@@ -13,9 +13,9 @@ const KsLoginComponent = {
                     <div style="background: rgba(255, 149, 0, 0.1); border: 1px solid rgba(255, 149, 0, 0.3); border-radius: 8px; padding: 14px 16px; margin-bottom: 20px; text-align: left; font-size: 0.88rem; color: var(--text-secondary); line-height: 1.6;">
                         <strong style="color: #ff9500;">💡 温馨提示：</strong>
                         <ul style="margin: 6px 0 0 16px; padding: 0;">
-                            <li>快手 App 强制开启单设备登录互斥机制，<strong>主账号扫码会导致手机端被踢下线</strong>。</li>
-                            <li>当前系统内<strong>所有核心功能均免登录即可流畅使用</strong>，通常无需登录！</li>
-                            <li>如需登录，强烈建议使用无关紧要的<strong>快手小号</strong>进行扫码。</li>
+                            <li>单作品解析与下载无需登录，可直接在「解析链接」中粘贴作品链接使用。</li>
+                            <li>作者主页批量作品获取受快手官方限制，需扫码登录后方可浏览并批量下载完整作品列表。</li>
+                            <li>快手 App 开启了单设备登录互斥，<strong>建议使用快手小号</strong>进行扫码登录。扫码完成后凭证自动保存。</li>
                         </ul>
                     </div>
 

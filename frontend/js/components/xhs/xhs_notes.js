@@ -113,10 +113,40 @@ const XhsNotesPage = {
             this._hasMore = res.has_more || false;
             this._loadedPages = 3;
             this._warning = (res && !Array.isArray(res)) ? res.warning : null;
+            this._loginRequired = (res && !Array.isArray(res)) ? !!res.login_required : false;
             this.renderNotes();
+
+            if (this._loginRequired || (this._warning && this._warning.includes('登录'))) {
+                Modal.confirm({
+                    title: '小红书登录已失效',
+                    message: '获取该博主笔记列表需要有效的小红书登录凭证。是否现在前往「登录管理」重新扫码登录？',
+                    confirmText: '前往扫码登录',
+                    cancelText: '暂不登录',
+                    onConfirm: () => {
+                        window.location.hash = '#xhs_login';
+                    }
+                });
+            }
         } catch (err) {
+            const isLoginErr = err.message && (err.message.includes('登录') || err.message.includes('安全限制'));
             if (grid) {
-                grid.innerHTML = `<div style="grid-column: 1/-1; text-align: center; color: var(--error); padding: 60px 24px;">获取笔记失败: ${this._esc(err.message)}</div>`;
+                grid.innerHTML = `
+                    <div style="grid-column: 1/-1; text-align: center; color: var(--error); padding: 60px 24px;">
+                        <p style="font-size: 1rem; margin-bottom: 12px;">获取笔记失败: ${this._esc(err.message)}</p>
+                        ${isLoginErr ? '<button class="btn btn-primary" onclick="window.location.hash=\'#xhs_login\'">🔑 前往小红书扫码登录</button>' : ''}
+                    </div>
+                `;
+            }
+            if (isLoginErr) {
+                Modal.confirm({
+                    title: '小红书需要登录',
+                    message: '获取博主笔记列表需要有效登录凭证。是否现在前往「登录管理」重新扫码登录？',
+                    confirmText: '前往扫码登录',
+                    cancelText: '暂不登录',
+                    onConfirm: () => {
+                        window.location.hash = '#xhs_login';
+                    }
+                });
             }
         }
     },
@@ -138,7 +168,10 @@ const XhsNotesPage = {
             : '';
 
         if (this._notes.length === 0) {
-            grid.innerHTML = warningBanner + `<div style="grid-column: 1/-1; text-align: center; color: var(--text-muted); padding: 60px 24px;">该博主没有笔记或获取失败</div>`;
+            const actionBtn = (this._loginRequired || (this._warning && this._warning.includes('登录')))
+                ? '<div style="margin-top: 16px;"><button class="btn btn-primary" onclick="window.location.hash=\'#xhs_login\'">🔑 前往小红书扫码登录</button></div>'
+                : '';
+            grid.innerHTML = warningBanner + `<div style="grid-column: 1/-1; text-align: center; color: var(--text-muted); padding: 60px 24px;">该博主没有笔记或获取失败${actionBtn}</div>`;
             return;
         }
 
