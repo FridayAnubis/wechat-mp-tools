@@ -96,6 +96,9 @@ app.register_blueprint(updater_bp)
 app.register_blueprint(waterwall_bp)
 
 
+# 确保必要目录与数据库结构就绪
+ensure_dirs()
+
 # 账号池旧数据迁移
 from backend.account_pool import migrate_legacy_config
 migrate_legacy_config()

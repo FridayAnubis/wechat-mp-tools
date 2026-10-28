@@ -56,6 +56,7 @@ app.register_blueprint(articles_bp)
 app.register_blueprint(account_pool_bp)
 app.register_blueprint(proxy_bp)
 
+ensure_dirs()
 migrate_legacy_config()
 
 # RSS 定时抓取（后台线程，失败不影响服务启动）
