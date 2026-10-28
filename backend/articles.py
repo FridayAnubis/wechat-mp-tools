@@ -1612,8 +1612,9 @@ def _do_collect_latest(task_id: str, targets: list, limit: int = 50, skip_existi
 @articles_bp.route("/open-folder", methods=["POST"])
 def open_folder():
     """在系统文件管理器中打开微信下载目录"""
-    import subprocess
+    import os
     import sys
+    import subprocess
     
     data = request.get_json() or {}
     account = data.get("account", "").strip()
@@ -1642,9 +1643,12 @@ def open_folder():
         if sys.platform == "darwin":
             subprocess.run(["open", resolved_path])
         elif sys.platform == "win32":
-            if hasattr(os, "startfile"):
-                os.startfile(resolved_path)
-            else:
+            try:
+                if hasattr(os, "startfile"):
+                    os.startfile(resolved_path)
+                else:
+                    subprocess.run(["explorer", resolved_path])
+            except Exception:
                 subprocess.run(["explorer", resolved_path])
         else:
             subprocess.run(["xdg-open", resolved_path])
@@ -1656,8 +1660,9 @@ def open_folder():
 @articles_bp.route("/open-file", methods=["POST"])
 def open_file():
     """在系统默认程序中打开特定的文件或文件夹，支持按类型定位 pdf/md"""
-    import subprocess
+    import os
     import sys
+    import subprocess
 
     data = request.get_json() or {}
     path_str = data.get("path", "")
@@ -1701,9 +1706,12 @@ def open_file():
         if sys.platform == "darwin":
             subprocess.run(["open", resolved_path])
         elif sys.platform == "win32":
-            if hasattr(os, "startfile"):
-                os.startfile(resolved_path)
-            else:
+            try:
+                if hasattr(os, "startfile"):
+                    os.startfile(resolved_path)
+                else:
+                    subprocess.run(["explorer", resolved_path])
+            except Exception:
                 subprocess.run(["explorer", resolved_path])
         else:
             subprocess.run(["xdg-open", resolved_path])
@@ -1715,8 +1723,9 @@ def open_file():
 @articles_bp.route("/open-parent", methods=["POST"])
 def open_parent():
     """打开文件所在的父目录并选中当前文件"""
-    import subprocess
+    import os
     import sys
+    import subprocess
 
     data = request.get_json() or {}
     path_str = data.get("path", "")
@@ -1750,9 +1759,12 @@ def open_parent():
             if sys.platform == "darwin":
                 subprocess.run(["open", resolved_path])
             elif sys.platform == "win32":
-                if hasattr(os, "startfile"):
-                    os.startfile(resolved_path)
-                else:
+                try:
+                    if hasattr(os, "startfile"):
+                        os.startfile(resolved_path)
+                    else:
+                        subprocess.run(["explorer", resolved_path])
+                except Exception:
                     subprocess.run(["explorer", resolved_path])
             else:
                 subprocess.run(["xdg-open", resolved_path])

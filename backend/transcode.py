@@ -936,8 +936,9 @@ def clear_completed():
 @transcode_bp.route("/open-parent", methods=["POST"])
 def open_parent():
     """在资源管理器中打开目标文件并选中当前文件"""
-    import subprocess
+    import os
     import sys
+    import subprocess
     data = request.get_json() or {}
     path_str = data.get("path", "")
     if not path_str:
@@ -960,7 +961,13 @@ def open_parent():
             if sys.platform == "darwin":
                 subprocess.run(["open", resolved_path])
             elif sys.platform == "win32":
-                os.startfile(resolved_path)
+                try:
+                    if hasattr(os, "startfile"):
+                        os.startfile(resolved_path)
+                    else:
+                        subprocess.run(["explorer", resolved_path])
+                except Exception:
+                    subprocess.run(["explorer", resolved_path])
             else:
                 subprocess.run(["xdg-open", resolved_path])
         return jsonify({"message": "已打开"})

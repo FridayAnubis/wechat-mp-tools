@@ -199,6 +199,10 @@ def download_progress():
 @updater_bp.route('/api/version/open-update-folder', methods=['POST'])
 def open_update_folder():
     """打开更新包所在目录"""
+    import os
+    import sys
+    import subprocess
+
     folder = str(_updates_dir())
 
     # 如果有已下载的文件，打开文件所在目录
@@ -209,10 +213,16 @@ def open_update_folder():
         folder = os.path.dirname(save_path)
 
     if sys.platform == "darwin":
-        os.system(f'open "{folder}"')
+        subprocess.run(["open", folder])
     elif sys.platform == "win32":
-        os.startfile(folder)
+        try:
+            if hasattr(os, "startfile"):
+                os.startfile(folder)
+            else:
+                subprocess.run(["explorer", folder])
+        except Exception:
+            subprocess.run(["explorer", folder])
     else:
-        os.system(f'xdg-open "{folder}"')
+        subprocess.run(["xdg-open", folder])
 
     return jsonify({"success": True, "path": folder})
