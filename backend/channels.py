@@ -291,43 +291,46 @@ def _do_cookie_acquisition():
     try:
         with sync_playwright() as p:
             browser = launch_chromium(p.chromium, headless=False)
-            
-            context = browser.new_context(
-                user_agent="Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36"
-            )
-            page = context.new_page()
             try:
-                page.goto("https://yuanbao.tencent.com/", wait_until="domcontentloaded", timeout=30000)
-            except Exception:
-                pass
-            
-            cookie_captured = None
-            start_time = time.time()
-            
-            # 最大等待 5 分钟 (300秒)
-            while time.time() - start_time < 300:
-                if page.is_closed():
-                    break
-                    
-                cookies = context.cookies()
-                # 检查元宝核心登录凭证 Cookie 'hy_token'
-                has_token = any(c['name'] == 'hy_token' for c in cookies)
+                context = browser.new_context(
+                    user_agent="Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36"
+                )
+                page = context.new_page()
+                try:
+                    page.goto("https://yuanbao.tencent.com/", wait_until="domcontentloaded", timeout=30000)
+                except Exception:
+                    pass
                 
-                if has_token:
-                    cookie_str = "; ".join([f"{c['name']}={c['value']}" for c in cookies])
-                    cookie_captured = cookie_str
-                    break
-                    
-                time.sleep(1.5)
+                cookie_captured = None
+                start_time = time.time()
                 
-            # 冗余读取：如果窗口被关掉，做最后一次检查
-            if not cookie_captured:
-                cookies = context.cookies()
-                has_token = any(c['name'] == 'hy_token' for c in cookies)
-                if has_token or len(cookies) > 5:
-                    cookie_captured = "; ".join([f"{c['name']}={c['value']}" for c in cookies])
+                # 最大等待 5 分钟 (300秒)
+                while time.time() - start_time < 300:
+                    if page.is_closed():
+                        break
+                        
+                    cookies = context.cookies()
+                    # 检查元宝核心登录凭证 Cookie 'hy_token'
+                    has_token = any(c['name'] == 'hy_token' for c in cookies)
                     
-            browser.close()
+                    if has_token:
+                        cookie_str = "; ".join([f"{c['name']}={c['value']}" for c in cookies])
+                        cookie_captured = cookie_str
+                        break
+                        
+                    time.sleep(1.5)
+                    
+                # 冗余读取：如果窗口被关掉，做最后一次检查
+                if not cookie_captured:
+                    cookies = context.cookies()
+                    has_token = any(c['name'] == 'hy_token' for c in cookies)
+                    if has_token or len(cookies) > 5:
+                        cookie_captured = "; ".join([f"{c['name']}={c['value']}" for c in cookies])
+            finally:
+                try:
+                    browser.close()
+                except Exception:
+                    pass
             
             if cookie_captured:
                 # 抓取成功，直接保存到配置文件中

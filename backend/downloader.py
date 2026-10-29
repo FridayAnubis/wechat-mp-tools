@@ -414,13 +414,16 @@ def _kill_process_group(proc: subprocess.Popen) -> None:
 def _reap_zombies() -> None:
     """非阻塞回收已退出的子进程/孤儿后代，防止僵尸进程 (<defunct>) 在容器内持续积累"""
     if sys.platform != "win32" and hasattr(os, "waitpid") and hasattr(os, "WNOHANG"):
-        try:
-            while True:
-                wpid, _ = os.waitpid(-1, os.WNOHANG)
-                if wpid <= 0:
-                    break
-        except (ChildProcessError, OSError):
-            pass
+        # 仅当 Python 自身作为容器内 PID 1 运行且未配置 init 时，孤儿进程才会重定向到自身，此时需主动回收；
+        # 若已有 init (如 docker-compose 的 init: true 或 tini)，则由 init 自动收割，避免影响其它并发线程的子进程
+        if hasattr(os, "getpid") and os.getpid() == 1:
+            try:
+                while True:
+                    wpid, _ = os.waitpid(-1, os.WNOHANG)
+                    if wpid <= 0:
+                        break
+            except (ChildProcessError, OSError):
+                pass
 
 
 def export_html_to_pdf(html_path: Path, pdf_path: Path, title: str = "") -> bool:
@@ -978,6 +981,8 @@ def fetch_via_headless_browser(url: str, proxy_url: str = None) -> tuple[str, st
             "--disable-blink-features=AutomationControlled",
             "--no-sandbox",
             "--disable-setuid-sandbox",
+            "--disable-dev-shm-usage",
+            "--disable-gpu",
         ]
         proxy_config = None
         if proxy_url:
