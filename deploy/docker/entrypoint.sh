@@ -33,4 +33,9 @@ fi
 
 echo "[entrypoint] 入口 ${APP_ENTRY} | 时区 ${TZ} | 监听 0.0.0.0:${PORT}"
 
+# 若容器未由 Docker 开启 --init (当前进程 PID=1)，且已安装 tini，由 tini 接管 PID 1 自动回收孤儿进程与转发信号
+if [ "$$" -eq 1 ] && command -v tini >/dev/null 2>&1; then
+    exec tini -s -- python "$APP_ENTRY" --no-browser --host 0.0.0.0 --port "${PORT}"
+fi
+
 exec python "$APP_ENTRY" --no-browser --host 0.0.0.0 --port "${PORT}"

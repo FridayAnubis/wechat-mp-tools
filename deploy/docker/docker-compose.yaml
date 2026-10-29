@@ -27,6 +27,8 @@ services:
     image: ${IMAGE:-wechat-mp-tools-mp:latest}
     container_name: wechat-mp-rss
     restart: unless-stopped
+    # 启用容器内置 init 进程 (tini)，负责信号转发与 Chrome/Crashpad 孤儿僵尸进程的自动回收
+    init: true
     environment:
       TZ: ${TZ:-Asia/Shanghai}
       PORT: "5200"

@@ -49,7 +49,7 @@ ENV PYTHONUNBUFFERED=1 \
     PLAYWRIGHT_BROWSERS_PATH=/app/ms-playwright
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        ca-certificates curl tzdata \
+        ca-certificates curl tini tzdata \
     && ln -snf /usr/share/zoneinfo/$TZ /etc/localtime \
     && echo "$TZ" > /etc/timezone \
     && rm -rf /var/lib/apt/lists/*

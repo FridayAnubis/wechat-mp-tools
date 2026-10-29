@@ -31,7 +31,7 @@ ENV PYTHONUNBUFFERED=1 \
     PLAYWRIGHT_BROWSERS_PATH=/app/ms-playwright
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        ca-certificates curl ffmpeg tzdata \
+        ca-certificates curl ffmpeg tini tzdata \
     && ln -snf /usr/share/zoneinfo/$TZ /etc/localtime \
     && echo "$TZ" > /etc/timezone \
     && rm -rf /var/lib/apt/lists/*
