@@ -1830,7 +1830,13 @@ def serve_file(filepath=""):
     default_out_dir = OUTPUT_DIR.resolve()
     data_dir = DATA_DIR.resolve()
 
-    allowed_roots = [str(download_dir), str(default_out_dir), str(data_dir)]
+    allowed_roots = [download_dir, default_out_dir]
+    safe_extensions = {
+        ".html", ".htm", ".md", ".pdf",
+        ".jpg", ".jpeg", ".png", ".gif", ".webp", ".svg",
+        ".mp4", ".mp3", ".wav", ".m4a",
+        ".css", ".js",
+    }
 
     query_path = request.args.get("path", "").strip()
     raw_path_str = query_path or filepath
@@ -1840,8 +1846,18 @@ def serve_file(filepath=""):
     decoded_path_str = unquote(raw_path_str)
 
     def is_safe_path(p: Path) -> bool:
-        p_res = str(p.resolve())
-        return any(p_res.startswith(root) for root in allowed_roots)
+        try:
+            p_res = p.resolve()
+            # 严禁直接访问 data 根目录下的系统凭据与配置文件（如 accounts.json, app_settings.json, *.db 等）
+            if p_res == data_dir or p_res.parent == data_dir:
+                return False
+            return any(
+                p_res.is_relative_to(root)
+                for root in allowed_roots
+                if str(root) != "/" and root.exists()
+            )
+        except (ValueError, OSError):
+            return False
 
     def find_html_in_dir(d: Path) -> Path | None:
         if not d.exists() or not d.is_dir():
@@ -1929,7 +1945,7 @@ def serve_file(filepath=""):
 </html>"""
         return Response(not_found_html, status=404, mimetype="text/html")
 
-    if not is_safe_path(target_path):
+    if not is_safe_path(target_path) or target_path.suffix.lower() not in safe_extensions:
         return "Access denied", 403
 
     return send_from_directory(target_path.parent, target_path.name)

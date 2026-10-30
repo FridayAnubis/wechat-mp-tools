@@ -44,6 +44,8 @@ services:
       RSS_BASE_URL: ${RSS_BASE_URL:-}
       RSS_LOCAL_AVATAR: ${RSS_LOCAL_AVATAR:-1}
       RSS_AVATAR_FROM_ARTICLE: ${RSS_AVATAR_FROM_ARTICLE:-1}
+      # 可选：Web 管理后台访问密码（留空免密；设置后开启 HTTP Basic 认证，防公网未授权访问）
+      ADMIN_PASSWORD: ${ADMIN_PASSWORD:-}
       # 数据库存储引擎配置（默认 sqlite 零配置落盘至 ./data/wechat_tools.db）
       # 若连接外部或下方容器内 MySQL，设为 DB_TYPE=mysql
       DB_TYPE: ${DB_TYPE:-sqlite}

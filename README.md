@@ -128,9 +128,23 @@ docker compose up -d --build
 容器运行仅需持久化挂载 `./data` 目录（存放登录凭据、系统配置、下载历史、RSS 缓存及下载文章）：
 - `PORT`：服务端监听端口（默认 `5200`）
 - `BIND_ADDR`：绑定地址（如需局域网或公网直接访问可设为 `0.0.0.0`，默认 `127.0.0.1` 配合 Nginx 反向代理）
-- `RSS_TOKEN`：可选，为 RSS 订阅源设置访问密钥（如 `?token=your_secret`）
-- `RSS_BASE_URL`：可选，反向代理时指定对外公开的 RSS 基准网址
+- `RSS_BASE_URL`：可选，反向代理时指定对外公开的 RSS 基准网址（前端复制订阅链接及 XML 导出的图片、链接将统一使用该域名）
+- `RSS_TOKEN`：可选，为 RSS 订阅源设置访问密钥（设置后需在订阅链接后附加 `?token=your_secret`）
+- `ADMIN_PASSWORD`：可选，Web 管理后台访问认证密码。若直接暴露公网，建议配置启用 HTTP Basic 密码保护（注：RSS 订阅不受此影响，继续由 `RSS_TOKEN` 独立保护）
 - `DB_TYPE`：数据库引擎类型（`sqlite` 或 `mysql`，默认 `sqlite`）
+
+### 5. 反向代理与公网安全最佳实践 (Lucky / Nginx / Caddy)
+
+当你在家里的 NAS 或服务器部署并通过 Lucky / Nginx 暴露至公网供外部 RSS 阅读器使用时，建议采用以下安全实践：
+
+- **方案 A：最小暴露面隔离（强烈推荐）**
+  - **Lucky / Nginx 规则中仅反代以下 3 个路径**：
+    1. `/api/articles/rss`（RSS 订阅源）
+    2. `/api/articles/avatars/`（公众号头像静态资源）
+    3. `/api/articles/serve-file/`（文章离线图片与 HTML 静态资源）
+  - **管理后台完全留在内网**：根路径 `/`、账号管理、扫码登录等接口不配置公网转发，公网无法接触到后台管理，实现物理级网络隔离。
+- **方案 B：全量反代 + ADMIN_PASSWORD 防御纵深**
+  - 若反代了整个站点根路径，务必在 `.env` 或系统设置中配置强密码 `ADMIN_PASSWORD`。系统会自动拦截未授权的后台管理访问，外部 RSS 阅读器抓取则自动放行。
 
 ---
 

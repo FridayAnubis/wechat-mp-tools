@@ -218,6 +218,30 @@ const SettingsPage = {
                         </div>
                     </div>
                 </div>
+
+                <!-- RSS Feed 输出服务与外部访问配置 -->
+                <div class="card">
+                    <div class="card-header">
+                        <h3 class="card-title">🌐 RSS Feed 订阅服务与公网安全</h3>
+                    </div>
+                    <div class="card-body" style="padding: 0 var(--spacing-md) var(--spacing-md);">
+                        <div class="form-group" style="margin-top: var(--spacing-md);">
+                            <label class="form-label" for="setting-rss-base-url">对外基准地址 (RSS_BASE_URL)</label>
+                            <input type="url" class="form-input" id="setting-rss-base-url" placeholder="例如：https://rss.example.com （反代后的外部域名，留空则自动跟随当前访问地址）" />
+                            <div class="form-hint">当使用 Lucky / Nginx 反向代理时，请填写外部访问的完整协议与域名。配置后，前端弹出的 RSS 复制地址与 XML 内容中的图片附件链接将始终使用此基准地址。</div>
+                        </div>
+                        <div class="form-group" style="margin-top: var(--spacing-md);">
+                            <label class="form-label" for="setting-rss-token">RSS 订阅安全令牌 (RSS_TOKEN)</label>
+                            <input type="text" class="form-input" id="setting-rss-token" placeholder="自定义安全令牌密钥（留空则公开可读）" />
+                            <div class="form-hint">设置后，RSS 订阅接口必须附加 ?token=xxx 才能拉取内容。前端复制订阅链接时会自动携带该令牌。</div>
+                        </div>
+                        <div class="form-group" style="margin-top: var(--spacing-md);">
+                            <label class="form-label" for="setting-admin-password">Web 管理后台访问密码 (ADMIN_PASSWORD)</label>
+                            <input type="password" class="form-input" id="setting-admin-password" placeholder="留空则内网免密；设置后访问管理后台需输入密码" />
+                            <div class="form-hint">若将整个服务通过 Lucky 反代暴露至公网，强烈建议配置此密码（启用 HTTP Basic 密码保护），防止管理后台被未授权访问。</div>
+                        </div>
+                    </div>
+                </div>
             </div>
 
             <div class="card" style="margin-top: var(--spacing-lg);">
@@ -281,6 +305,9 @@ const SettingsPage = {
         const rssEndMinute = document.getElementById('setting-rss-end-minute');
         const rssUploadEnabled = document.getElementById('setting-rss-upload-enabled');
         const rssUploadUrl = document.getElementById('setting-rss-upload-url');
+        const rssBaseUrl = document.getElementById('setting-rss-base-url');
+        const rssToken = document.getElementById('setting-rss-token');
+        const adminPassword = document.getElementById('setting-admin-password');
         
         const biliQuality = document.getElementById('setting-bili-quality');
         const biliDanmaku = document.getElementById('setting-bili-danmaku');
@@ -306,6 +333,9 @@ const SettingsPage = {
         if (rssEndMinute) rssEndMinute.value = data.rss_end_minute !== undefined ? data.rss_end_minute : 0;
         if (rssUploadEnabled) rssUploadEnabled.checked = data.rss_upload_enabled !== undefined ? !!data.rss_upload_enabled : false;
         if (rssUploadUrl) rssUploadUrl.value = data.rss_upload_url || '';
+        if (rssBaseUrl) rssBaseUrl.value = data.rss_base_url || '';
+        if (rssToken) rssToken.value = data.rss_token || '';
+        if (adminPassword) adminPassword.value = data.admin_password || '';
         
         if (biliQuality) biliQuality.value = data.bili_video_quality || '1080p';
         if (biliDanmaku) biliDanmaku.checked = data.bili_download_danmaku !== undefined ? !!data.bili_download_danmaku : true;
@@ -358,6 +388,9 @@ const SettingsPage = {
         const rssEndMinute = document.getElementById('setting-rss-end-minute');
         const rssUploadEnabled = document.getElementById('setting-rss-upload-enabled');
         const rssUploadUrl = document.getElementById('setting-rss-upload-url');
+        const rssBaseUrl = document.getElementById('setting-rss-base-url');
+        const rssToken = document.getElementById('setting-rss-token');
+        const adminPassword = document.getElementById('setting-admin-password');
         
         const biliQuality = document.getElementById('setting-bili-quality');
         const biliDanmaku = document.getElementById('setting-bili-danmaku');
@@ -390,6 +423,9 @@ const SettingsPage = {
             rss_end_minute: rssEndMinute && !rssEndMinute.disabled ? parseInt(rssEndMinute.value) : 0,
             rss_upload_enabled: rssUploadEnabled ? rssUploadEnabled.checked : false,
             rss_upload_url: rssUploadUrl ? rssUploadUrl.value.trim() : '',
+            rss_base_url: rssBaseUrl ? rssBaseUrl.value.trim() : '',
+            rss_token: rssToken ? rssToken.value.trim() : '',
+            admin_password: adminPassword ? adminPassword.value.trim() : '',
             bili_video_quality: biliQuality ? biliQuality.value : '1080p',
             bili_download_danmaku: biliDanmaku ? biliDanmaku.checked : true,
             bili_download_subtitle: biliSubtitle ? biliSubtitle.checked : true,
@@ -424,6 +460,9 @@ const SettingsPage = {
                 rss_end_minute: 0,
                 rss_upload_enabled: false,
                 rss_upload_url: '',
+                rss_base_url: '',
+                rss_token: '',
+                admin_password: '',
                 bili_video_quality: '1080p',
                 bili_download_danmaku: true,
                 bili_download_subtitle: true,

@@ -15,7 +15,7 @@ from pathlib import Path
 from backend.runtime import app_dir
 
 # ── 版本号 ────────────────────────────────────────────────
-APP_VERSION = "2.3.5"
+APP_VERSION = "2.3.6"
 
 # ── 路径配置 ──────────────────────────────────────────────
 if getattr(sys, 'frozen', False):
@@ -71,6 +71,7 @@ DEFAULT_SETTINGS = {
     "rss_base_url": "",
     "rss_local_avatar": True,
     "rss_avatar_from_article": True,
+    "admin_password": os.environ.get("ADMIN_PASSWORD", ""),
     "weread_platform_url": WEREAD_PLATFORM_URL,
     # ── 数据库配置 ──────────────────────────────────────────
     "db_type": os.environ.get("DB_TYPE", "sqlite"),  # "sqlite", "mysql", "json"
@@ -124,6 +125,15 @@ def get_settings() -> dict:
     for key, val in DEFAULT_SETTINGS.items():
         if key not in settings:
             settings[key] = val
+
+    # 容器/环境变量支持：若设置文件中为空，自动回退到环境变量
+    for s_key, env_key in [
+        ("rss_base_url", "RSS_BASE_URL"),
+        ("rss_token", "RSS_TOKEN"),
+        ("admin_password", "ADMIN_PASSWORD"),
+    ]:
+        if not settings.get(s_key) and os.environ.get(env_key):
+            settings[s_key] = os.environ.get(env_key, "").strip()
 
     # 容器/迁移场景：设置里记的是另一台机器的绝对路径（比如桌面版的
     # /Users/xxx/data/articles_full），在当前环境根本不存在，会导致下载失败。
@@ -388,6 +398,64 @@ def normalize_wechat_url(url: str) -> str:
     except Exception:
         pass
     return url
+
+
+def init_admin_auth(app):
+    """可选的 Web 管理后台访问安全防护中间件。
+    当配置了 ADMIN_PASSWORD 环境变量或设置项时：
+    - 公开放行：/healthz 探针、/api/articles/rss（由 RSS_TOKEN 独立保护）、/api/articles/avatars/、/api/articles/serve-file/
+    - 其余所有管理路由和接口：必须通过 HTTP Basic Auth 或 Token 校验，否则返回 401 触发浏览器密码弹窗。
+    - 未配置 ADMIN_PASSWORD 时：保持原样，局域网/本机直接免密访问。
+    """
+    import hmac
+    from flask import request, Response
+
+    @app.before_request
+    def _check_admin_auth():
+        settings = get_settings()
+        admin_pass = str(settings.get("admin_password") or os.environ.get("ADMIN_PASSWORD", "")).strip()
+        if not admin_pass:
+            return None
+
+        if request.method == "OPTIONS":
+            return None
+
+        path = request.path
+
+        # 白名单放行路由
+        if (
+            path == "/healthz"
+            or path.startswith("/api/articles/rss")
+            or path.startswith("/api/articles/avatars/")
+            or path.startswith("/api/articles/serve-file/")
+        ):
+            return None
+
+        # 1. 优先校验 HTTP Basic Auth（用户名随意，密码等于 admin_password）
+        auth = request.authorization
+        if auth and auth.password and hmac.compare_digest(auth.password, admin_pass):
+            return None
+
+        # 2. 兼容 Bearer Token、URL 参数 ?auth=xxx 或 Cookie admin_auth=xxx
+        supplied = ""
+        auth_hdr = request.headers.get("Authorization", "")
+        if auth_hdr.lower().startswith("bearer "):
+            supplied = auth_hdr[7:].strip()
+        elif request.args.get("auth"):
+            supplied = request.args.get("auth", "").strip()
+        elif request.cookies.get("admin_auth"):
+            supplied = request.cookies.get("admin_auth", "").strip()
+
+        if supplied and hmac.compare_digest(supplied, admin_pass):
+            return None
+
+        return Response(
+            "需要管理员权限，请输入管理密码",
+            status=401,
+            headers={"WWW-Authenticate": 'Basic realm="Wechat Tools Admin", charset="UTF-8"'},
+            mimetype="text/plain; charset=utf-8",
+        )
+
 
 
 def get_default_wechat_ua() -> str:

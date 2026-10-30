@@ -217,8 +217,6 @@ const AccountsPage = {
     },
 
     async showRssModal(fakeid, nickname) {
-        const rssUrl = `${window.location.origin}/api/articles/rss/${encodeURIComponent(nickname)}`;
-
         // Remove existing modal if any
         const existing = document.getElementById('rss-modal-overlay');
         if (existing) existing.remove();
@@ -231,16 +229,27 @@ const AccountsPage = {
         // Fetch current subscription status and global upload setting
         let sub = null;
         let globalUploadEnabled = false;
+        let settings = {};
         try {
             const [subsRes, settingsRes] = await Promise.all([
                 API.accounts.rssSubscriptions(),
                 API.settings.get(),
             ]);
             sub = (subsRes.subscriptions || []).find(s => s.fakeid === fakeid);
-            globalUploadEnabled = !!settingsRes.rss_upload_enabled;
+            settings = settingsRes || {};
+            globalUploadEnabled = !!settings.rss_upload_enabled;
         } catch (err) {
             console.error("加载订阅状态失败", err);
         }
+
+        let baseOrigin = (settings.rss_base_url || '').trim().replace(/\/+$/, '');
+        if (baseOrigin && !/^https?:\/\//i.test(baseOrigin)) {
+            baseOrigin = 'https://' + baseOrigin;
+        }
+        baseOrigin = baseOrigin || window.location.origin;
+        const token = (settings.rss_token || '').trim();
+        const tokenQuery = token ? `?token=${encodeURIComponent(token)}` : '';
+        const rssUrl = `${baseOrigin}/api/articles/rss/${encodeURIComponent(nickname)}${tokenQuery}`;
 
         let isSubscribed = sub ? sub.enabled : false;
         let interval = sub ? sub.interval_minutes : 60;

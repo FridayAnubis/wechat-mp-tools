@@ -437,6 +437,8 @@ def render_feed(items: list, title: str, description: str,
 def _resolve_base_url(request, settings: dict) -> str:
     explicit = str(_cfg(settings, "rss_base_url", "RSS_BASE_URL", "") or "").strip()
     if explicit:
+        if not explicit.startswith(("http://", "https://")):
+            explicit = "https://" + explicit
         return explicit.rstrip("/") + "/"
     proto = request.headers.get("X-Forwarded-Proto") or request.scheme or "http"
     host = request.headers.get("X-Forwarded-Host") or request.host

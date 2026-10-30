@@ -831,16 +831,28 @@ const HistoryPage = {
         }
     },
 
-    showRssModal() {
-        const baseOrigin = window.location.origin;
-        const globalRss = `${baseOrigin}/api/articles/rss`;
+    async showRssModal() {
+        let settings = {};
+        try {
+            settings = await API.settings.get();
+        } catch (err) {
+            console.warn("获取设置失败，回退默认地址:", err);
+        }
+        let baseOrigin = (settings.rss_base_url || '').trim().replace(/\/+$/, '');
+        if (baseOrigin && !/^https?:\/\//i.test(baseOrigin)) {
+            baseOrigin = 'https://' + baseOrigin;
+        }
+        baseOrigin = baseOrigin || window.location.origin;
+        const token = (settings.rss_token || '').trim();
+        const tokenQuery = token ? `?token=${encodeURIComponent(token)}` : '';
+        const globalRss = `${baseOrigin}/api/articles/rss${tokenQuery}`;
         
         let accountRssHtml = '';
         if (this.uniqueAccounts.length > 0) {
             accountRssHtml = `
                 <div style="margin-top: 10px; font-size: 0.85rem; font-weight: 600; color: var(--text-secondary);">按公众号分源订阅：</div>
                 ${this.uniqueAccounts.map(account => {
-                    const accRss = `${baseOrigin}/api/articles/rss/${encodeURIComponent(account)}`;
+                    const accRss = `${baseOrigin}/api/articles/rss/${encodeURIComponent(account)}${tokenQuery}`;
                     return `
                         <div class="rss-item-box">
                             <span class="rss-item-title">${this.escapeHtml(account)}</span>
