@@ -1,0 +1,140 @@
+name: Sync upstream and publish lite image
+
+on:
+  schedule:
+    # 每 6 小时检查一次
+    - cron: '0 */6 * * *'
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# 同步和发布共享串行队列，避免两个运行同时写 main 或更新 latest。
+concurrency:
+  group: sync-upstream-docker-main
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    outputs:
+      revision: ${{ steps.revision.outputs.sha }}
+    steps:
+      - name: Checkout main with full history
+        uses: actions/checkout@v6
+        with:
+          ref: main
+          fetch-depth: 0
+          token: ${{ secrets.UPSTREAM_SYNC_TOKEN || github.token }}
+
+      - name: Rebuild fork commit on upstream main
+        if: github.event_name != 'push'
+        env:
+          UPSTREAM_REPOSITORY: ${{ vars.UPSTREAM_REPOSITORY || 'x554960766/wechat-mp-tools' }}
+        run: bash .github/scripts/sync-upstream.sh
+
+      - name: Record the exact commit to publish
+        id: revision
+        run: echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+  publish:
+    needs: sync
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+      DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+      DOCKERHUB_REPOSITORY: ${{ vars.DOCKERHUB_REPOSITORY }}
+      REVISION: ${{ needs.sync.outputs.revision }}
+    steps:
+      - name: Check Docker Hub configuration
+        id: image
+        shell: bash
+        run: |
+          if [[ -z "$DOCKERHUB_USERNAME" || -z "$DOCKERHUB_TOKEN" ]]; then
+            echo "::error::Set the DOCKERHUB_USERNAME and DOCKERHUB_TOKEN repository secrets."
+            exit 1
+          fi
+          image="${DOCKERHUB_REPOSITORY:-${DOCKERHUB_USERNAME}/wechat-mp-tools}"
+          if [[ ! "$image" =~ ^[a-z0-9_-]+/[a-z0-9][a-z0-9._-]*$ ]]; then
+            echo "::error::DOCKERHUB_REPOSITORY must be a lowercase Docker Hub namespace/repository."
+            exit 1
+          fi
+          echo "name=$image" >> "$GITHUB_OUTPUT"
+
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v4
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Check whether this commit was already published
+        id: published
+        env:
+          IMAGE: ${{ steps.image.outputs.name }}
+          EVENT_NAME: ${{ github.event_name }}
+        shell: bash
+        run: |
+          # 手动运行始终重建；缺失 SHA 标签时重试，涵盖上次同步成功但发布失败的情况。
+          if [[ "$EVENT_NAME" != "workflow_dispatch" ]] && \
+              docker manifest inspect "$IMAGE:sha-$REVISION" > /dev/null 2>&1; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            echo "### Already published: $IMAGE:sha-$REVISION" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Checkout the synced commit
+        if: steps.published.outputs.skip != 'true'
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ needs.sync.outputs.revision }}
+          persist-credentials: false
+
+      - name: Set up QEMU for ARM64
+        if: steps.published.outputs.skip != 'true'
+        uses: docker/setup-qemu-action@v4
+        with:
+          platforms: arm64
+
+      - name: Set up Docker Buildx
+        if: steps.published.outputs.skip != 'true'
+        uses: docker/setup-buildx-action@v4
+
+      - name: Build and push the lite image
+        if: steps.published.outputs.skip != 'true'
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: deploy/docker/Dockerfile
+          build-args: INSTALL_BROWSERS=0
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: |
+            ${{ steps.image.outputs.name }}:latest
+            ${{ steps.image.outputs.name }}:lite
+            ${{ steps.image.outputs.name }}:sha-${{ needs.sync.outputs.revision }}
+          labels: |
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.revision=${{ needs.sync.outputs.revision }}
+            org.opencontainers.image.title=WeChat MP Tools Lite
+          cache-from: type=gha,scope=wechat-mp-tools-lite
+          cache-to: type=gha,mode=max,scope=wechat-mp-tools-lite
+
+      - name: Summarize publication
+        if: steps.published.outputs.skip != 'true'
+        env:
+          IMAGE: ${{ steps.image.outputs.name }}
+        run: |
+          {
+            echo "### Published lite image (amd64 / arm64)"
+            echo "- $IMAGE:latest"
+            echo "- $IMAGE:lite"
+            echo "- $IMAGE:sha-$REVISION"
+          } >> "$GITHUB_STEP_SUMMARY"
